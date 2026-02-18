@@ -7,6 +7,73 @@ import (
 	"time"
 )
 
+type ProviderID string
+
+const (
+	ProviderClaude ProviderID = "claude"
+	ProviderCodex  ProviderID = "codex"
+)
+
+type AppState int
+
+const (
+	StateChooseProvider AppState = iota
+	StateDashboard
+)
+
+type ProviderMeta struct {
+	ID            ProviderID
+	DisplayName   string
+	HeaderTitle   string
+	VersionPrefix string
+}
+
+var providerCatalog = []ProviderMeta{
+	{
+		ID:            ProviderClaude,
+		DisplayName:   "Claude Code",
+		HeaderTitle:   "CLAUDE CODE STATUS",
+		VersionPrefix: "Claude Code",
+	},
+	{
+		ID:            ProviderCodex,
+		DisplayName:   "OpenAI Codex",
+		HeaderTitle:   "OPENAI CODEX STATUS",
+		VersionPrefix: "Codex CLI",
+	},
+}
+
+func allProviders() []ProviderMeta {
+	return providerCatalog
+}
+
+func providerMeta(id ProviderID) ProviderMeta {
+	for _, provider := range providerCatalog {
+		if provider.ID == id {
+			return provider
+		}
+	}
+	return providerCatalog[0]
+}
+
+func providerIndex(id ProviderID) int {
+	for i, provider := range providerCatalog {
+		if provider.ID == id {
+			return i
+		}
+	}
+	return 0
+}
+
+func isValidProvider(id ProviderID) bool {
+	for _, provider := range providerCatalog {
+		if provider.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // FlexibleTime wraps time.Time to unmarshal from both JSON numbers (Unix ms)
 // and strings (RFC3339). The credentials file uses a number, but other sources
 // may use a string.
@@ -107,12 +174,15 @@ type OAuthTokenResponse struct {
 
 // DashboardData holds all data displayed on the dashboard.
 type DashboardData struct {
-	// OAuth usage
-	SessionUtil   float64
-	SessionResets time.Time
-	WeeklyUtil    float64
-	WeeklyResets  time.Time
-	HasOAuthData  bool
+	ProviderID ProviderID
+
+	// Session usage windows
+	SessionUtil    float64
+	SessionResets  time.Time
+	HasSessionData bool
+	WeeklyUtil     float64
+	WeeklyResets   time.Time
+	HasWeeklyData  bool
 
 	// ccusage - today
 	DailyCost   float64
@@ -124,9 +194,9 @@ type DashboardData struct {
 	MonthlyTokens  int
 	HasMonthlyData bool
 
-	// Claude version
-	ClaudeVersion  string
-	HasVersionData bool
+	// Provider version (Claude / Codex)
+	ProviderVersion string
+	HasVersionData  bool
 
 	// Metadata
 	LastUpdated time.Time
@@ -138,5 +208,6 @@ type DashboardData struct {
 type tickMsg struct{}
 
 type dataFetchedMsg struct {
-	data DashboardData
+	provider ProviderID
+	data     DashboardData
 }
