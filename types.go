@@ -14,6 +14,13 @@ type FlexibleTime struct {
 	time.Time
 }
 
+func (ft FlexibleTime) MarshalJSON() ([]byte, error) {
+	if ft.Time.IsZero() {
+		return []byte("null"), nil
+	}
+	return []byte(strconv.FormatInt(ft.Time.UnixMilli(), 10)), nil
+}
+
 func (ft *FlexibleTime) UnmarshalJSON(data []byte) error {
 	s := string(data)
 	if s == "null" || s == `""` {
@@ -58,32 +65,44 @@ type UsageData struct {
 
 // CcusageTotals holds the totals object from ccusage JSON output.
 type CcusageTotals struct {
-	TotalCost float64 `json:"totalCost"`
+	TotalCost   float64 `json:"totalCost"`
+	TotalTokens int     `json:"totalTokens"`
+}
+
+// CcusageDaily holds a single day's entry from the ccusage daily array.
+type CcusageDaily struct {
+	Date        string  `json:"date"`
+	TotalCost   float64 `json:"totalCost"`
+	TotalTokens int     `json:"totalTokens"`
 }
 
 // CcusageOutput holds the parsed ccusage daily JSON output.
 type CcusageOutput struct {
-	Totals CcusageTotals `json:"totals"`
+	Totals CcusageTotals  `json:"totals"`
+	Daily  []CcusageDaily `json:"daily"`
+}
+
+// OAuthCredentials holds the OAuth token fields from the credentials file.
+type OAuthCredentials struct {
+	AccessToken      string       `json:"accessToken"`
+	RefreshToken     string       `json:"refreshToken"`
+	ExpiresAt        FlexibleTime `json:"expiresAt"`
+	Scopes           []string     `json:"scopes,omitempty"`
+	SubscriptionType string       `json:"subscriptionType,omitempty"`
+	RateLimitTier    string       `json:"rateLimitTier,omitempty"`
 }
 
 // CredentialsFile represents ~/.claude/.credentials.json.
 type CredentialsFile struct {
-	ClaudeAiOauth struct {
-		AccessToken string `json:"accessToken"`
-		ExpiresAt   FlexibleTime `json:"expiresAt"`
-	} `json:"claudeAiOauth"`
+	ClaudeAiOauth OAuthCredentials `json:"claudeAiOauth"`
 }
 
-// DailyActivity represents a single day's activity entry from stats-cache.
-type DailyActivity struct {
-	Date         string `json:"date"`
-	MessageCount int    `json:"messageCount"`
-	SessionCount int    `json:"sessionCount"`
-}
-
-// StatsCache represents the structure of ~/.claude/stats-cache.json.
-type StatsCache struct {
-	DailyActivity []DailyActivity `json:"dailyActivity"`
+// OAuthTokenResponse represents the OAuth2 token endpoint response.
+type OAuthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresIn    int64  `json:"expires_in"`
+	TokenType    string `json:"token_type"`
 }
 
 // DashboardData holds all data displayed on the dashboard.
@@ -95,14 +114,19 @@ type DashboardData struct {
 	WeeklyResets  time.Time
 	HasOAuthData  bool
 
-	// ccusage cost
+	// ccusage - today
 	DailyCost   float64
+	DailyTokens int
 	HasCostData bool
 
-	// Stats cache
-	MessageCount int
-	SessionCount int
-	HasStatsData bool
+	// ccusage - last 30 days
+	MonthlyCost    float64
+	MonthlyTokens  int
+	HasMonthlyData bool
+
+	// Claude version
+	ClaudeVersion  string
+	HasVersionData bool
 
 	// Metadata
 	LastUpdated time.Time

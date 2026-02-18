@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -10,7 +11,6 @@ import (
 
 const (
 	refreshInterval = 60
-	dashboardWidth  = 54
 	minWidth        = 56
 	minHeight       = 20
 )
@@ -100,6 +100,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// contentWidth returns the usable width inside the outer border (border + padding).
+func (m model) contentWidth() int {
+	// 2 border chars + 4 horizontal padding (2 each side)
+	cw := m.width - 6
+	if cw < 34 {
+		cw = 34
+	}
+	return cw
+}
+
+// barWidth returns the progress bar width, proportional to content width.
+func (m model) barWidth() int {
+	bw := m.contentWidth() * 40 / 100
+	if bw < 10 {
+		bw = 10
+	}
+	return bw
+}
+
 func (m model) View() string {
 	if m.width < minWidth || m.height < minHeight {
 		if m.width == 0 && m.height == 0 {
@@ -108,31 +127,43 @@ func (m model) View() string {
 		msg := lipgloss.NewStyle().
 			Foreground(colorOrange).
 			Bold(true).
-			Render("Terminal too small (need 56×20)")
+			Render("Terminal too small (need 56x20)")
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, msg,
 			lipgloss.WithWhitespaceBackground(colorBackground))
 	}
+
+	cw := m.contentWidth()
 
 	// Header
 	header := lipgloss.NewStyle().
 		Foreground(colorPurple).
 		Bold(true).
-		Width(dashboardWidth).
+		Width(cw).
 		Align(lipgloss.Center).
 		Render("CLAUDE CODE STATUS")
+
+	// Version line
+	var versionLine string
+	if m.data.HasVersionData {
+		versionLine = lipgloss.NewStyle().
+			Foreground(colorComment).
+			Width(cw).
+			Align(lipgloss.Center).
+			Render(fmt.Sprintf("Claude Code v%s", m.data.ClaudeVersion))
+	}
 
 	// Status line
 	var statusLine string
 	if m.fetching {
 		statusLine = lipgloss.NewStyle().
 			Foreground(colorCyan).
-			Width(dashboardWidth).
+			Width(cw).
 			Align(lipgloss.Center).
 			Render(m.spinner.View() + " Refreshing...")
 	} else if !m.data.LastUpdated.IsZero() {
 		statusLine = lipgloss.NewStyle().
 			Foreground(colorComment).
-			Width(dashboardWidth).
+			Width(cw).
 			Align(lipgloss.Center).
 			Render("Last updated: " + m.data.LastUpdated.Format("15:04:05"))
 	}
@@ -143,7 +174,7 @@ func (m model) View() string {
 		errorLine = lipgloss.NewStyle().
 			Foreground(colorComment).
 			Italic(true).
-			Width(dashboardWidth).
+			Width(cw).
 			Align(lipgloss.Center).
 			Render(m.data.Errors[len(m.data.Errors)-1])
 	}
@@ -152,81 +183,114 @@ func (m model) View() string {
 	sessionPanel := m.renderSessionPanel()
 	weeklyPanel := m.renderWeeklyPanel()
 	todayPanel := m.renderTodayPanel()
+	monthlyPanel := m.renderMonthlyPanel()
 
 	// Footer
 	footer := lipgloss.NewStyle().
 		Foreground(colorComment).
-		Width(dashboardWidth).
+		Width(cw).
 		Align(lipgloss.Center).
 		Render("q: quit • r: refresh • Next: " + formatCountdown(m.secondsToRefresh))
 
 	// Compose inner content
-	parts := []string{header, "", statusLine}
+	parts := []string{header}
+	if versionLine != "" {
+		parts = append(parts, versionLine)
+	}
+	parts = append(parts, statusLine)
 	if errorLine != "" {
 		parts = append(parts, errorLine)
 	}
-	parts = append(parts, "", sessionPanel, "", weeklyPanel, "", todayPanel, "", footer)
+	parts = append(parts, "", sessionPanel, "", weeklyPanel, "", todayPanel, "", monthlyPanel, "", footer)
 
 	inner := lipgloss.JoinVertical(lipgloss.Center, parts...)
 
-	// Outer frame
+	// Outer frame — fill terminal
+	frameWidth := m.width - 2   // subtract border left + right
+	frameHeight := m.height - 2 // subtract border top + bottom
+
 	outerFrame := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorPurple).
-		Padding(1, 2).
-		Render(inner)
+		Padding(0, 2).
+		Width(frameWidth).
+		Height(frameHeight).
+		Render(lipgloss.PlaceVertical(frameHeight, lipgloss.Center, inner))
 
-	// Center in terminal
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, outerFrame,
 		lipgloss.WithWhitespaceBackground(colorBackground))
 }
 
 func (m model) renderSessionPanel() string {
+	cw := m.contentWidth()
 	if !m.data.HasOAuthData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
-		return renderPanel("Session (5h)", content, dashboardWidth)
+		return renderPanel("Session (5h)", content, cw)
 	}
 
-	bar := renderBrailleBar(m.data.SessionUtil, 20)
+	bar := renderBrailleBar(m.data.SessionUtil, m.barWidth())
 	pct := formatPercent(m.data.SessionUtil)
 	resetStr := formatDuration(time.Until(m.data.SessionResets))
+	resetAt := m.data.SessionResets.Local().Format("15:04")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		bar+" "+pct,
-		renderMetricRow("Resets in", resetStr, dashboardWidth-4),
+		renderMetricRow("Resets in", resetStr, cw-4),
+		renderMetricRow("Resets at", resetAt, cw-4),
 	)
-	return renderPanel("Session (5h)", content, dashboardWidth)
+	return renderPanel("Session (5h)", content, cw)
 }
 
 func (m model) renderWeeklyPanel() string {
+	cw := m.contentWidth()
 	if !m.data.HasOAuthData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
-		return renderPanel("Weekly (7d)", content, dashboardWidth)
+		return renderPanel("Weekly (7d)", content, cw)
 	}
 
-	bar := renderBrailleBar(m.data.WeeklyUtil, 20)
+	bar := renderBrailleBar(m.data.WeeklyUtil, m.barWidth())
 	pct := formatPercent(m.data.WeeklyUtil)
 	resetStr := formatDuration(time.Until(m.data.WeeklyResets))
+	resetAt := m.data.WeeklyResets.Local().Format("15:04")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		bar+" "+pct,
-		renderMetricRow("Resets in", resetStr, dashboardWidth-4),
+		renderMetricRow("Resets in", resetStr, cw-4),
+		renderMetricRow("Resets at", resetAt, cw-4),
 	)
-	return renderPanel("Weekly (7d)", content, dashboardWidth)
+	return renderPanel("Weekly (7d)", content, cw)
 }
 
 func (m model) renderTodayPanel() string {
+	cw := m.contentWidth()
 	costStr := "N/A"
+	tokenStr := "N/A"
 	if m.data.HasCostData {
 		costStr = formatCost(m.data.DailyCost)
+		tokenStr = formatTokens(m.data.DailyTokens)
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		renderMetricRow("Cost", costStr, dashboardWidth-4),
-		renderMetricRow("Messages", formatInt(m.data.MessageCount), dashboardWidth-4),
-		renderMetricRow("Sessions", formatInt(m.data.SessionCount), dashboardWidth-4),
+		renderMetricRow("Cost", costStr, cw-4),
+		renderMetricRow("Tokens", tokenStr, cw-4),
 	)
-	return renderPanel("Today", content, dashboardWidth)
+	return renderPanel("Today", content, cw)
+}
+
+func (m model) renderMonthlyPanel() string {
+	cw := m.contentWidth()
+	costStr := "N/A"
+	tokenStr := "N/A"
+	if m.data.HasMonthlyData {
+		costStr = formatCost(m.data.MonthlyCost)
+		tokenStr = formatTokens(m.data.MonthlyTokens)
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		renderMetricRow("Cost", costStr, cw-4),
+		renderMetricRow("Tokens", tokenStr, cw-4),
+	)
+	return renderPanel("Last 30 Days", content, cw)
 }
 
 func formatCountdown(seconds int) string {
@@ -250,13 +314,19 @@ func mergeData(old, new DashboardData) DashboardData {
 
 	if new.HasCostData {
 		result.DailyCost = new.DailyCost
+		result.DailyTokens = new.DailyTokens
 		result.HasCostData = true
 	}
 
-	if new.HasStatsData {
-		result.MessageCount = new.MessageCount
-		result.SessionCount = new.SessionCount
-		result.HasStatsData = true
+	if new.HasMonthlyData {
+		result.MonthlyCost = new.MonthlyCost
+		result.MonthlyTokens = new.MonthlyTokens
+		result.HasMonthlyData = true
+	}
+
+	if new.HasVersionData {
+		result.ClaudeVersion = new.ClaudeVersion
+		result.HasVersionData = true
 	}
 
 	result.LastUpdated = new.LastUpdated

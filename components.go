@@ -59,7 +59,7 @@ func renderPanel(title string, content string, outerWidth int) string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorComment).
 		Padding(0, 1).
-		Width(outerWidth).
+		Width(outerWidth - 2). // lipgloss Width excludes border chars
 		Render(styled)
 
 	return injectBorderTitle(box, title)
@@ -143,4 +143,18 @@ func formatCost(cost float64) string {
 // formatInt formats an integer as a string.
 func formatInt(n int) string {
 	return fmt.Sprintf("%d", n)
+}
+
+// formatTokens formats a token count with K/M/B suffixes.
+func formatTokens(n int) string {
+	switch {
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB", float64(n)/1_000_000_000)
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
