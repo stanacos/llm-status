@@ -7,7 +7,7 @@ This is a single-package Go Bubble Tea TUI (`package main`) with source files at
 - `model.go`: UI state machine, provider selection screen, refresh loop, key handling (`q`, `r`, `p`).
 - `fetch.go`: provider-specific data fetchers (Claude and Codex), command execution, API/log parsing.
 - `types.go`: shared domain types (`ProviderID`, `DashboardData`, message types).
-- `config.go`: persistent user config (`~/.claude-status/config.json`) for last selected provider.
+- `config.go`: persistent user config (`~/.llm-status/config.json`) for last selected provider.
 - `components.go` / `theme.go`: rendering helpers and style palette.
 
 Keep new code in root files unless a package split is clearly justified.
@@ -15,8 +15,8 @@ Keep new code in root files unless a package split is clearly justified.
 ## Build, Test, and Development Commands
 - `go run .`: run the dashboard locally.
 - `go build ./...`: compile all packages.
-- `go build -o claude-status .`: build local binary.
-- `go test ./...`: run unit tests (none committed yet).
+- `go build -o llm-status .`: build local binary.
+- `go test ./...`: run unit tests.
 - `go vet ./...`: run static checks.
 - `gofmt -w *.go`: format all Go sources before commit.
 
@@ -50,5 +50,5 @@ Do not commit secrets or personal usage artifacts.
 
 - Claude credentials: `~/.claude/.credentials.json`.
 - Codex usage/status source: `~/.codex/sessions/*.jsonl`.
-- App config: `~/.claude-status/config.json`.
+- App config: `~/.llm-status/config.json`.
 - External tools invoked: `claude --version`, `codex --version`, `npx ccusage@latest`, `npx @ccusage/codex@latest`.

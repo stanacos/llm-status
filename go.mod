@@ -1,4 +1,4 @@
-module github.com/stana/claude-status
+module github.com/stana/llm-status
 
 go 1.25.7
 
