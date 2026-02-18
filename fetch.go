@@ -536,7 +536,7 @@ func doUsageRequest(token string) (*UsageData, int, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "claude-status/1.0")
+	req.Header.Set("User-Agent", "llm-status/1.0")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
