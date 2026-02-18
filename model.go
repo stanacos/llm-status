@@ -47,6 +47,9 @@ func newModel() model {
 	if err != nil {
 		m.data.Errors = append(m.data.Errors, "config: "+err.Error())
 	}
+	if err := checkNpxAvailable(); err != nil {
+		m.data.Errors = append(m.data.Errors, err.Error())
+	}
 	if isValidProvider(provider) {
 		m.state = StateDashboard
 		m.selectedProvider = provider
