@@ -16,6 +16,10 @@ const (
 )
 
 type model struct {
+	state            AppState
+	selectedProvider ProviderID
+	providerMenuIdx  int
+
 	data             DashboardData
 	spinner          spinner.Model
 	fetching         bool
@@ -32,19 +36,34 @@ func newModel() model {
 	}
 	s.Style = lipgloss.NewStyle().Foreground(colorCyan)
 
-	return model{
+	m := model{
+		state:            StateChooseProvider,
+		providerMenuIdx:  0,
 		spinner:          s,
-		fetching:         true,
 		secondsToRefresh: refreshInterval,
 	}
+
+	provider, err := loadLastProvider()
+	if err != nil {
+		m.data.Errors = append(m.data.Errors, "config: "+err.Error())
+	}
+	if isValidProvider(provider) {
+		m.state = StateDashboard
+		m.selectedProvider = provider
+		m.providerMenuIdx = providerIndex(provider)
+		m.fetching = true
+		m.data.ProviderID = provider
+	}
+
+	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		m.spinner.Tick,
-		doTick(),
-		fetchAllDataCmd(),
-	)
+	cmds := []tea.Cmd{m.spinner.Tick, doTick()}
+	if m.state == StateDashboard {
+		cmds = append(cmds, fetchAllDataCmd(m.selectedProvider))
+	}
+	return tea.Batch(cmds...)
 }
 
 func doTick() tea.Cmd {
@@ -53,10 +72,10 @@ func doTick() tea.Cmd {
 	})
 }
 
-func fetchAllDataCmd() tea.Cmd {
+func fetchAllDataCmd(provider ProviderID) tea.Cmd {
 	return func() tea.Msg {
-		data := fetchAllData()
-		return dataFetchedMsg{data: data}
+		data := fetchAllDataForProvider(provider)
+		return dataFetchedMsg{provider: provider, data: data}
 	}
 }
 
@@ -66,10 +85,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		}
+
+		if m.state == StateChooseProvider {
+			switch msg.String() {
+			case "up", "k":
+				providers := allProviders()
+				if len(providers) == 0 {
+					return m, nil
+				}
+				m.providerMenuIdx--
+				if m.providerMenuIdx < 0 {
+					m.providerMenuIdx = len(providers) - 1
+				}
+				return m, nil
+			case "down", "j":
+				providers := allProviders()
+				if len(providers) == 0 {
+					return m, nil
+				}
+				m.providerMenuIdx++
+				if m.providerMenuIdx >= len(providers) {
+					m.providerMenuIdx = 0
+				}
+				return m, nil
+			case "enter":
+				providers := allProviders()
+				if len(providers) == 0 {
+					return m, nil
+				}
+				chosen := providers[m.providerMenuIdx].ID
+				m.state = StateDashboard
+				m.selectedProvider = chosen
+				m.fetching = true
+				m.secondsToRefresh = refreshInterval
+				m.data = DashboardData{ProviderID: chosen}
+				if err := saveLastProvider(chosen); err != nil {
+					m.data.Errors = append(m.data.Errors, "config: "+err.Error())
+				}
+				return m, fetchAllDataCmd(chosen)
+			}
+			return m, nil
+		}
+
+		switch msg.String() {
 		case "r":
 			m.fetching = true
 			m.secondsToRefresh = refreshInterval
-			return m, fetchAllDataCmd()
+			return m, fetchAllDataCmd(m.selectedProvider)
+		case "p":
+			m.state = StateChooseProvider
+			m.fetching = false
+			m.providerMenuIdx = providerIndex(m.selectedProvider)
+			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
@@ -78,15 +146,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		if m.state != StateDashboard {
+			return m, doTick()
+		}
+
 		m.secondsToRefresh--
 		if m.secondsToRefresh <= 0 {
 			m.fetching = true
 			m.secondsToRefresh = refreshInterval
-			return m, tea.Batch(doTick(), fetchAllDataCmd())
+			return m, tea.Batch(doTick(), fetchAllDataCmd(m.selectedProvider))
 		}
 		return m, doTick()
 
 	case dataFetchedMsg:
+		if m.state != StateDashboard || msg.provider != m.selectedProvider {
+			return m, nil
+		}
+		if m.data.ProviderID != msg.provider {
+			m.data = DashboardData{ProviderID: msg.provider}
+		}
 		m.data = mergeData(m.data, msg.data)
 		m.fetching = false
 		return m, nil
@@ -132,7 +210,74 @@ func (m model) View() string {
 			lipgloss.WithWhitespaceBackground(colorBackground))
 	}
 
+	if m.state == StateChooseProvider {
+		return m.renderProviderSelectionView()
+	}
+	return m.renderDashboardView()
+}
+
+func (m model) renderProviderSelectionView() string {
 	cw := m.contentWidth()
+
+	title := lipgloss.NewStyle().
+		Foreground(colorPurple).
+		Bold(true).
+		Width(cw).
+		Align(lipgloss.Center).
+		Render("SELECT PROVIDER")
+
+	description := lipgloss.NewStyle().
+		Foreground(colorComment).
+		Width(cw).
+		Align(lipgloss.Center).
+		Render("Use ↑/↓ (or j/k) and Enter")
+
+	providers := allProviders()
+	lines := make([]string, 0, len(providers))
+	for i, provider := range providers {
+		lineStyle := lipgloss.NewStyle().
+			Foreground(colorForeground).
+			Width(cw).
+			Align(lipgloss.Center)
+
+		prefix := "  "
+		if i == m.providerMenuIdx {
+			prefix = "› "
+			lineStyle = lineStyle.Foreground(colorCyan).Bold(true)
+		}
+
+		lines = append(lines, lineStyle.Render(prefix+provider.DisplayName))
+	}
+
+	hints := lipgloss.NewStyle().
+		Foreground(colorComment).
+		Width(cw).
+		Align(lipgloss.Center).
+		Render("q: quit")
+
+	parts := []string{title, "", description, ""}
+	parts = append(parts, lines...)
+	parts = append(parts, "", hints)
+
+	inner := lipgloss.JoinVertical(lipgloss.Center, parts...)
+
+	frameWidth := m.width - 2
+	frameHeight := m.height - 2
+	outerFrame := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorPurple).
+		Padding(0, 2).
+		Width(frameWidth).
+		Height(frameHeight).
+		Render(lipgloss.PlaceVertical(frameHeight, lipgloss.Center, inner))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, outerFrame,
+		lipgloss.WithWhitespaceBackground(colorBackground))
+}
+
+func (m model) renderDashboardView() string {
+	cw := m.contentWidth()
+	meta := providerMeta(m.selectedProvider)
 
 	// Header
 	header := lipgloss.NewStyle().
@@ -140,7 +285,7 @@ func (m model) View() string {
 		Bold(true).
 		Width(cw).
 		Align(lipgloss.Center).
-		Render("CLAUDE CODE STATUS")
+		Render(meta.HeaderTitle)
 
 	// Version line
 	var versionLine string
@@ -149,7 +294,7 @@ func (m model) View() string {
 			Foreground(colorComment).
 			Width(cw).
 			Align(lipgloss.Center).
-			Render(fmt.Sprintf("Claude Code v%s", m.data.ClaudeVersion))
+			Render(fmt.Sprintf("%s v%s", meta.VersionPrefix, m.data.ProviderVersion))
 	}
 
 	// Status line
@@ -190,9 +335,8 @@ func (m model) View() string {
 		Foreground(colorComment).
 		Width(cw).
 		Align(lipgloss.Center).
-		Render("q: quit • r: refresh • Next: " + formatCountdown(m.secondsToRefresh))
+		Render("q: quit • p: providers • r: refresh • Next: " + formatCountdown(m.secondsToRefresh))
 
-	// Compose inner content
 	parts := []string{header}
 	if versionLine != "" {
 		parts = append(parts, versionLine)
@@ -205,10 +349,8 @@ func (m model) View() string {
 
 	inner := lipgloss.JoinVertical(lipgloss.Center, parts...)
 
-	// Outer frame — fill terminal
-	frameWidth := m.width - 2   // subtract border left + right
-	frameHeight := m.height - 2 // subtract border top + bottom
-
+	frameWidth := m.width - 2
+	frameHeight := m.height - 2
 	outerFrame := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorPurple).
@@ -223,7 +365,7 @@ func (m model) View() string {
 
 func (m model) renderSessionPanel() string {
 	cw := m.contentWidth()
-	if !m.data.HasOAuthData {
+	if !m.data.HasSessionData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
 		return renderPanel("Session (5h)", content, cw)
 	}
@@ -243,19 +385,19 @@ func (m model) renderSessionPanel() string {
 
 func (m model) renderWeeklyPanel() string {
 	cw := m.contentWidth()
-	if !m.data.HasOAuthData {
+	if !m.data.HasWeeklyData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
 		return renderPanel("Weekly (7d)", content, cw)
 	}
 
 	bar := renderBrailleBar(m.data.WeeklyUtil, m.barWidth())
 	pct := formatPercent(m.data.WeeklyUtil)
-	resetStr := formatDuration(time.Until(m.data.WeeklyResets))
+	resetDate := m.data.WeeklyResets.Local().Format("Mon 02/01")
 	resetAt := m.data.WeeklyResets.Local().Format("15:04")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		bar+" "+pct,
-		renderMetricRow("Resets in", resetStr, cw-4),
+		renderMetricRow("Resets on", resetDate, cw-4),
 		renderMetricRow("Resets at", resetAt, cw-4),
 	)
 	return renderPanel("Weekly (7d)", content, cw)
@@ -303,13 +445,18 @@ func formatCountdown(seconds int) string {
 // mergeData merges new data into old, retaining previous values for failed sources.
 func mergeData(old, new DashboardData) DashboardData {
 	result := old
+	result.ProviderID = new.ProviderID
 
-	if new.HasOAuthData {
+	if new.HasSessionData {
 		result.SessionUtil = new.SessionUtil
 		result.SessionResets = new.SessionResets
+		result.HasSessionData = true
+	}
+
+	if new.HasWeeklyData {
 		result.WeeklyUtil = new.WeeklyUtil
 		result.WeeklyResets = new.WeeklyResets
-		result.HasOAuthData = true
+		result.HasWeeklyData = true
 	}
 
 	if new.HasCostData {
@@ -325,7 +472,7 @@ func mergeData(old, new DashboardData) DashboardData {
 	}
 
 	if new.HasVersionData {
-		result.ClaudeVersion = new.ClaudeVersion
+		result.ProviderVersion = new.ProviderVersion
 		result.HasVersionData = true
 	}
 
