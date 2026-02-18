@@ -536,7 +536,7 @@ func doUsageRequest(token string) (*UsageData, int, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "llm-status/1.0")
+	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -604,6 +604,13 @@ func fetchOAuthUsage() (*UsageData, error) {
 	}
 
 	return nil, err
+}
+
+func checkNpxAvailable() error {
+	if _, err := exec.LookPath("npx"); err != nil {
+		return errors.New("npx not found in PATH (required for cost data) - install Node.js: https://nodejs.org")
+	}
+	return nil
 }
 
 // fetchClaudeCcusage runs ccusage for the last 30 days and extracts today + totals.

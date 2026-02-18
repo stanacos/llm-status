@@ -13,12 +13,17 @@ This is a single-package Go Bubble Tea TUI (`package main`) with source files at
 Keep new code in root files unless a package split is clearly justified.
 
 ## Build, Test, and Development Commands
-- `go run .`: run the dashboard locally.
-- `go build ./...`: compile all packages.
-- `go build -o llm-status .`: build local binary.
-- `go test ./...`: run unit tests.
-- `go vet ./...`: run static checks.
-- `gofmt -w *.go`: format all Go sources before commit.
+- `make build`: build `./llm-status` with build metadata injected via ldflags.
+- `make run`: run the app with the same ldflags metadata injection.
+- `make test`: run unit tests.
+- `make vet`: run static checks.
+- `make fmt`: format all Go source files.
+- `make clean`: remove the local `./llm-status` binary.
+- `./llm-status --version` (or `./llm-status -v`): prints `llm-status <version> (commit: <commit>, built: <date>)`.
+- Build-time ldflags variables:
+  - `VERSION` (default `dev`) -> `main.version`
+  - `COMMIT` (default `git rev-parse --short HEAD` or `none`) -> `main.commit`
+  - `DATE` (default UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`) -> `main.date`
 
 ## Coding Style & Naming Conventions
 Use idiomatic Go and keep code `gofmt`-clean.
