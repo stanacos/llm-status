@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,18 +26,88 @@ const (
 	tokenExpiryBuffer = 5 * time.Minute
 )
 
-// ccusageResult holds parsed results from a single ccusage call.
-type ccusageResult struct {
-	dailyCost    float64
-	dailyTokens  int
-	hasDailyData bool
-	monthlyCost  float64
-	monthlyTokens int
+var errNoTokenCount = errors.New("no token_count event found")
+
+// costResult holds parsed results from a single cost command call.
+type costResult struct {
+	dailyCost      float64
+	dailyTokens    int
+	hasDailyData   bool
+	monthlyCost    float64
+	monthlyTokens  int
+	hasMonthlyData bool
 }
 
-// fetchAllData fetches data from all sources concurrently.
-func fetchAllData() DashboardData {
-	var data DashboardData
+type codexCcusageTotals struct {
+	CostUSD     float64 `json:"costUSD"`
+	TotalTokens int     `json:"totalTokens"`
+}
+
+type codexCcusageDaily struct {
+	Date        string  `json:"date"`
+	CostUSD     float64 `json:"costUSD"`
+	TotalTokens int     `json:"totalTokens"`
+}
+
+type codexCcusageOutput struct {
+	Totals codexCcusageTotals  `json:"totals"`
+	Daily  []codexCcusageDaily `json:"daily"`
+}
+
+type codexLogLine struct {
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type codexEventType struct {
+	Type string `json:"type"`
+}
+
+type codexTokenCountPayload struct {
+	Type       string          `json:"type"`
+	RateLimits codexRateLimits `json:"rate_limits"`
+}
+
+type codexRateLimits struct {
+	Primary   codexRateLimit `json:"primary"`
+	Secondary codexRateLimit `json:"secondary"`
+}
+
+type codexRateLimit struct {
+	UsedPercent   float64 `json:"used_percent"`
+	WindowMinutes int     `json:"window_minutes"`
+	ResetsAt      int64   `json:"resets_at"`
+}
+
+type codexStatusSnapshot struct {
+	timestamp   time.Time
+	hasSession  bool
+	sessionUtil float64
+	sessionEnds time.Time
+	hasWeekly   bool
+	weeklyUtil  float64
+	weeklyEnds  time.Time
+}
+
+// fetchAllDataForProvider fetches provider-specific dashboard data.
+func fetchAllDataForProvider(provider ProviderID) DashboardData {
+	switch provider {
+	case ProviderClaude:
+		return fetchClaudeData()
+	case ProviderCodex:
+		return fetchCodexData()
+	default:
+		return DashboardData{
+			ProviderID:  provider,
+			LastUpdated: time.Now(),
+			Errors:      []string{fmt.Sprintf("unknown provider %q", provider)},
+		}
+	}
+}
+
+func fetchClaudeData() DashboardData {
+	data := DashboardData{ProviderID: ProviderClaude}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -50,15 +125,16 @@ func fetchAllData() DashboardData {
 		}
 		data.SessionUtil = usage.FiveHour.Utilization
 		data.SessionResets = usage.FiveHour.ResetsAt
+		data.HasSessionData = true
 		data.WeeklyUtil = usage.SevenDay.Utilization
 		data.WeeklyResets = usage.SevenDay.ResetsAt
-		data.HasOAuthData = true
+		data.HasWeeklyData = true
 	}()
 
 	// ccusage cost + tokens (30-day window, extract today from daily array)
 	go func() {
 		defer wg.Done()
-		result, err := fetchCcusage()
+		result, err := fetchClaudeCcusage()
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
@@ -70,9 +146,11 @@ func fetchAllData() DashboardData {
 			data.DailyTokens = result.dailyTokens
 			data.HasCostData = true
 		}
-		data.MonthlyCost = result.monthlyCost
-		data.MonthlyTokens = result.monthlyTokens
-		data.HasMonthlyData = true
+		if result.hasMonthlyData {
+			data.MonthlyCost = result.monthlyCost
+			data.MonthlyTokens = result.monthlyTokens
+			data.HasMonthlyData = true
+		}
 	}()
 
 	// Claude Code version
@@ -85,13 +163,249 @@ func fetchAllData() DashboardData {
 			data.Errors = append(data.Errors, "version: "+err.Error())
 			return
 		}
-		data.ClaudeVersion = version
+		data.ProviderVersion = version
 		data.HasVersionData = true
 	}()
 
 	wg.Wait()
 	data.LastUpdated = time.Now()
 	return data
+}
+
+func fetchCodexData() DashboardData {
+	data := DashboardData{ProviderID: ProviderCodex}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	wg.Add(3)
+
+	// Session and weekly status from Codex session logs.
+	go func() {
+		defer wg.Done()
+		status, err := fetchCodexStatusFromLogs()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "status: "+err.Error())
+			return
+		}
+		if status.hasSession {
+			data.SessionUtil = status.sessionUtil
+			data.SessionResets = status.sessionEnds
+			data.HasSessionData = true
+		}
+		if status.hasWeekly {
+			data.WeeklyUtil = status.weeklyUtil
+			data.WeeklyResets = status.weeklyEnds
+			data.HasWeeklyData = true
+		}
+	}()
+
+	// Codex cost + tokens from @ccusage/codex.
+	go func() {
+		defer wg.Done()
+		result, err := fetchCodexCcusage()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "ccusage/codex: "+err.Error())
+			return
+		}
+		if result.hasDailyData {
+			data.DailyCost = result.dailyCost
+			data.DailyTokens = result.dailyTokens
+			data.HasCostData = true
+		}
+		if result.hasMonthlyData {
+			data.MonthlyCost = result.monthlyCost
+			data.MonthlyTokens = result.monthlyTokens
+			data.HasMonthlyData = true
+		}
+	}()
+
+	// Codex CLI version.
+	go func() {
+		defer wg.Done()
+		version, err := fetchCodexVersion()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "version: "+err.Error())
+			return
+		}
+		data.ProviderVersion = version
+		data.HasVersionData = true
+	}()
+
+	wg.Wait()
+	data.LastUpdated = time.Now()
+	return data
+}
+
+func fetchCodexStatusFromLogs() (*codexStatusSnapshot, error) {
+	files, err := listCodexSessionFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for _, filePath := range files {
+		status, err := parseLatestTokenCountFromFile(filePath)
+		if err == nil {
+			return status, nil
+		}
+		if errors.Is(err, errNoTokenCount) {
+			continue
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no token_count status found in ~/.codex/sessions")
+}
+
+func listCodexSessionFiles() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("home dir: %w", err)
+	}
+
+	root := filepath.Join(home, ".codex", "sessions")
+	var files []string
+
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Skip unreadable files/directories, keep scanning.
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) == ".jsonl" {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("codex sessions directory not found")
+		}
+		return nil, fmt.Errorf("walk codex sessions: %w", err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no codex session files found")
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i] > files[j]
+	})
+	return files, nil
+}
+
+func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open codex log %s: %w", path, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+
+	var latest codexStatusSnapshot
+	found := false
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		var record codexLogLine
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue
+		}
+		if record.Type != "event_msg" || len(record.Payload) == 0 {
+			continue
+		}
+
+		var evtType codexEventType
+		if err := json.Unmarshal(record.Payload, &evtType); err != nil {
+			continue
+		}
+		if evtType.Type != "token_count" {
+			continue
+		}
+
+		var payload codexTokenCountPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			continue
+		}
+
+		snapshot := codexStatusSnapshot{}
+		applyCodexRateLimits(&snapshot, payload.RateLimits)
+		if !snapshot.hasSession && !snapshot.hasWeekly {
+			continue
+		}
+
+		if ts, err := time.Parse(time.RFC3339Nano, record.Timestamp); err == nil {
+			snapshot.timestamp = ts
+		}
+
+		if !found {
+			latest = snapshot
+			found = true
+			continue
+		}
+
+		if latest.timestamp.IsZero() || snapshot.timestamp.After(latest.timestamp) {
+			latest = snapshot
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan codex log %s: %w", path, err)
+	}
+	if !found {
+		return nil, errNoTokenCount
+	}
+	return &latest, nil
+}
+
+func applyCodexRateLimits(snapshot *codexStatusSnapshot, limits codexRateLimits) {
+	observed := []codexRateLimit{limits.Primary, limits.Secondary}
+	for _, limit := range observed {
+		switch limit.WindowMinutes {
+		case 300:
+			setSessionLimit(snapshot, limit)
+		case 10080:
+			setWeeklyLimit(snapshot, limit)
+		}
+	}
+
+	if !snapshot.hasSession {
+		setSessionLimit(snapshot, limits.Primary)
+	}
+	if !snapshot.hasWeekly {
+		setWeeklyLimit(snapshot, limits.Secondary)
+	}
+}
+
+func setSessionLimit(snapshot *codexStatusSnapshot, limit codexRateLimit) {
+	if limit.ResetsAt <= 0 {
+		return
+	}
+	snapshot.sessionUtil = limit.UsedPercent
+	snapshot.sessionEnds = time.Unix(limit.ResetsAt, 0)
+	snapshot.hasSession = true
+}
+
+func setWeeklyLimit(snapshot *codexStatusSnapshot, limit codexRateLimit) {
+	if limit.ResetsAt <= 0 {
+		return
+	}
+	snapshot.weeklyUtil = limit.UsedPercent
+	snapshot.weeklyEnds = time.Unix(limit.ResetsAt, 0)
+	snapshot.hasWeekly = true
 }
 
 // refreshOAuthToken exchanges a refresh token for a new access token.
@@ -138,7 +452,7 @@ func saveCredentials(credPath string, creds *CredentialsFile) error {
 	data = append(data, '\n')
 
 	// Preserve original file permissions
-	perm := os.FileMode(0600)
+	perm := os.FileMode(0o600)
 	if info, err := os.Stat(credPath); err == nil {
 		perm = info.Mode().Perm()
 	}
@@ -186,12 +500,12 @@ func ensureValidToken(credPath string, creds *CredentialsFile) (string, error) {
 // refreshAndSave forces a token refresh and saves the updated credentials.
 func refreshAndSave(credPath string, creds *CredentialsFile) (string, error) {
 	if creds.ClaudeAiOauth.RefreshToken == "" {
-		return "", fmt.Errorf("token expired and no refresh token — run `claude` to re-authenticate")
+		return "", fmt.Errorf("token expired and no refresh token - run `claude` to re-authenticate")
 	}
 
 	tokenResp, err := refreshOAuthToken(creds.ClaudeAiOauth.RefreshToken)
 	if err != nil {
-		return "", fmt.Errorf("token refresh failed — run `claude` to re-authenticate: %w", err)
+		return "", fmt.Errorf("token refresh failed - run `claude` to re-authenticate: %w", err)
 	}
 
 	// Update credentials in-place
@@ -202,7 +516,7 @@ func refreshAndSave(credPath string, creds *CredentialsFile) (string, error) {
 	}
 
 	if err := saveCredentials(credPath, creds); err != nil {
-		// Token is refreshed in memory even if save fails — still usable this session
+		// Token is refreshed in memory even if save fails - still usable this session
 		return creds.ClaudeAiOauth.AccessToken, nil
 	}
 
@@ -292,15 +606,14 @@ func fetchOAuthUsage() (*UsageData, error) {
 	return nil, err
 }
 
-// fetchCcusage runs ccusage for the last 30 days and extracts today + totals.
-func fetchCcusage() (*ccusageResult, error) {
+// fetchClaudeCcusage runs ccusage for the last 30 days and extracts today + totals.
+func fetchClaudeCcusage() (*costResult, error) {
 	since := time.Now().AddDate(0, 0, -30).Format("20060102")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "npx", "ccusage@latest", "daily", "--json", "--since", since)
-	output, err := cmd.Output()
+	output, err := runCommand(ctx, "npx", "ccusage@latest", "daily", "--json", "--since", since)
 	if err != nil {
 		return nil, fmt.Errorf("run ccusage: %w", err)
 	}
@@ -310,9 +623,10 @@ func fetchCcusage() (*ccusageResult, error) {
 		return nil, fmt.Errorf("parse ccusage: %w", err)
 	}
 
-	result := &ccusageResult{
-		monthlyCost:   parsed.Totals.TotalCost,
-		monthlyTokens: parsed.Totals.TotalTokens,
+	result := &costResult{
+		monthlyCost:    parsed.Totals.TotalCost,
+		monthlyTokens:  parsed.Totals.TotalTokens,
+		hasMonthlyData: true,
 	}
 
 	// Find today's entry in the daily array
@@ -329,21 +643,132 @@ func fetchCcusage() (*ccusageResult, error) {
 	return result, nil
 }
 
+// fetchCodexCcusage runs @ccusage/codex for the last 30 days and extracts today + totals.
+func fetchCodexCcusage() (*costResult, error) {
+	timezone := localTimezone()
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		timezone = "UTC"
+		location = time.UTC
+	}
+
+	now := time.Now().In(location)
+	since := now.AddDate(0, 0, -30).Format("20060102")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	output, err := runCommand(
+		ctx,
+		"npx",
+		"@ccusage/codex@latest",
+		"daily",
+		"--json",
+		"--since",
+		since,
+		"--timezone",
+		timezone,
+		"--locale",
+		"en-US",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("run @ccusage/codex: %w", err)
+	}
+
+	var parsed codexCcusageOutput
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		return nil, fmt.Errorf("parse @ccusage/codex output: %w", err)
+	}
+
+	result := &costResult{
+		monthlyCost:    parsed.Totals.CostUSD,
+		monthlyTokens:  parsed.Totals.TotalTokens,
+		hasMonthlyData: true,
+	}
+
+	for _, entry := range parsed.Daily {
+		entryDate, err := time.ParseInLocation("Jan 2, 2006", entry.Date, location)
+		if err != nil {
+			continue
+		}
+		if sameCalendarDay(entryDate, now) {
+			result.dailyCost = entry.CostUSD
+			result.dailyTokens = entry.TotalTokens
+			result.hasDailyData = true
+			break
+		}
+	}
+
+	return result, nil
+}
+
+func localTimezone() string {
+	tz := strings.TrimSpace(os.Getenv("TZ"))
+	if tz != "" {
+		return tz
+	}
+
+	name := time.Now().Location().String()
+	if name == "" || name == "Local" {
+		return "UTC"
+	}
+	return name
+}
+
+func sameCalendarDay(a, b time.Time) bool {
+	aYear, aMonth, aDay := a.Date()
+	bYear, bMonth, bDay := b.Date()
+	return aYear == bYear && aMonth == bMonth && aDay == bDay
+}
+
 // fetchClaudeVersion runs `claude --version` and parses the version string.
 func fetchClaudeVersion() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "claude", "--version")
-	output, err := cmd.Output()
+	output, err := runCommand(ctx, "claude", "--version")
 	if err != nil {
 		return "", fmt.Errorf("run claude --version: %w", err)
 	}
 
-	// Output format: "2.1.39 (Claude Code)\n" — extract version number
+	// Output format: "2.1.39 (Claude Code)" - extract version number.
 	raw := strings.TrimSpace(string(output))
 	if idx := strings.Index(raw, " "); idx > 0 {
 		return raw[:idx], nil
 	}
 	return raw, nil
+}
+
+// fetchCodexVersion runs `codex --version` and parses the version string.
+func fetchCodexVersion() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	output, err := runCommand(ctx, "codex", "--version")
+	if err != nil {
+		return "", fmt.Errorf("run codex --version: %w", err)
+	}
+
+	raw := strings.TrimSpace(string(output))
+	fields := strings.Fields(raw)
+	if len(fields) >= 2 {
+		return fields[1], nil
+	}
+	return raw, nil
+}
+
+func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return nil, fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, detail)
+		}
+		return nil, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
+	}
+	return output, nil
 }
