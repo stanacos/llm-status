@@ -402,13 +402,28 @@ func (m model) renderDashboardView() string {
 
 func (m model) renderSessionPanel() string {
 	cw := m.contentWidth()
+	title := providerMeta(m.selectedProvider).SessionLabel
 	if !m.data.HasSessionData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
-		return renderPanel("Session (5h)", content, cw)
+		return renderPanel(title, content, cw)
 	}
 
 	bar := renderBrailleBar(m.data.SessionUtil, m.barWidth())
 	pct := formatPercent(m.data.SessionUtil)
+
+	if m.selectedProvider == ProviderOpenCode {
+		used := fmt.Sprintf("%d / %d", m.data.QuotaUsed, m.data.QuotaEntitlement)
+		resetDate := m.data.SessionResets.Local().Format("Mon 02/01")
+
+		content := lipgloss.JoinVertical(lipgloss.Left,
+			bar+" "+pct,
+			renderMetricRow("Used", used, cw-4),
+			renderMetricRow("Resets on", resetDate, cw-4),
+			renderMetricRow("Resets at", "00:00", cw-4),
+		)
+		return renderPanel(title, content, cw)
+	}
+
 	resetStr := formatDuration(time.Until(m.data.SessionResets))
 	resetAt := m.data.SessionResets.Local().Format("15:04")
 
@@ -417,18 +432,33 @@ func (m model) renderSessionPanel() string {
 		renderMetricRow("Resets in", resetStr, cw-4),
 		renderMetricRow("Resets at", resetAt, cw-4),
 	)
-	return renderPanel("Session (5h)", content, cw)
+	return renderPanel(title, content, cw)
 }
 
 func (m model) renderWeeklyPanel() string {
 	cw := m.contentWidth()
+	title := providerMeta(m.selectedProvider).WeeklyLabel
 	if !m.data.HasWeeklyData {
 		content := lipgloss.NewStyle().Foreground(colorComment).Render("N/A")
-		return renderPanel("Weekly (7d)", content, cw)
+		return renderPanel(title, content, cw)
 	}
 
 	bar := renderBrailleBar(m.data.WeeklyUtil, m.barWidth())
 	pct := formatPercent(m.data.WeeklyUtil)
+
+	if m.selectedProvider == ProviderOpenCode {
+		projected := fmt.Sprintf("%d / %d", m.data.QuotaProjected, m.data.QuotaEntitlement)
+		daysLeft := fmt.Sprintf("%d", m.data.QuotaDaysLeft)
+
+		content := lipgloss.JoinVertical(lipgloss.Left,
+			bar+" "+pct,
+			renderMetricRow("Projected", projected, cw-4),
+			renderMetricRow("Days left", daysLeft, cw-4),
+			renderMetricRow("Pace", m.data.QuotaPace, cw-4),
+		)
+		return renderPanel(title, content, cw)
+	}
+
 	resetDate := m.data.WeeklyResets.Local().Format("Mon 02/01")
 	resetAt := m.data.WeeklyResets.Local().Format("15:04")
 
@@ -437,7 +467,7 @@ func (m model) renderWeeklyPanel() string {
 		renderMetricRow("Resets on", resetDate, cw-4),
 		renderMetricRow("Resets at", resetAt, cw-4),
 	)
-	return renderPanel("Weekly (7d)", content, cw)
+	return renderPanel(title, content, cw)
 }
 
 func (m model) renderTodayPanel() string {
@@ -487,6 +517,14 @@ func mergeData(old, new DashboardData) DashboardData {
 		result.WeeklyUtil = new.WeeklyUtil
 		result.WeeklyResets = new.WeeklyResets
 		result.HasWeeklyData = true
+	}
+
+	if new.HasSessionData || new.HasWeeklyData {
+		result.QuotaUsed = new.QuotaUsed
+		result.QuotaEntitlement = new.QuotaEntitlement
+		result.QuotaProjected = new.QuotaProjected
+		result.QuotaDaysLeft = new.QuotaDaysLeft
+		result.QuotaPace = new.QuotaPace
 	}
 
 	if new.HasCostData {

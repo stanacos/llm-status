@@ -10,8 +10,9 @@ import (
 type ProviderID string
 
 const (
-	ProviderClaude ProviderID = "claude"
-	ProviderCodex  ProviderID = "codex"
+	ProviderClaude   ProviderID = "claude"
+	ProviderCodex    ProviderID = "codex"
+	ProviderOpenCode ProviderID = "opencode"
 )
 
 type AppState int
@@ -26,6 +27,8 @@ type ProviderMeta struct {
 	DisplayName   string
 	HeaderTitle   string
 	VersionPrefix string
+	SessionLabel  string
+	WeeklyLabel   string
 }
 
 var providerCatalog = []ProviderMeta{
@@ -34,12 +37,24 @@ var providerCatalog = []ProviderMeta{
 		DisplayName:   "Claude Code",
 		HeaderTitle:   "CLAUDE CODE STATUS",
 		VersionPrefix: "Claude Code",
+		SessionLabel:  "Session (5h)",
+		WeeklyLabel:   "Weekly (7d)",
 	},
 	{
 		ID:            ProviderCodex,
 		DisplayName:   "OpenAI Codex",
 		HeaderTitle:   "OPENAI CODEX STATUS",
 		VersionPrefix: "Codex CLI",
+		SessionLabel:  "Session (5h)",
+		WeeklyLabel:   "Weekly (7d)",
+	},
+	{
+		ID:            ProviderOpenCode,
+		DisplayName:   "OpenCode",
+		HeaderTitle:   "OPENCODE STATUS",
+		VersionPrefix: "OpenCode",
+		SessionLabel:  "Quota (Used)",
+		WeeklyLabel:   "Quota (Projected)",
 	},
 }
 
@@ -172,6 +187,34 @@ type OAuthTokenResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
+// OpenCodeAuthFile represents ~/.local/share/opencode/auth.json.
+type OpenCodeAuthFile struct {
+	GitHubCopilot OpenCodeAuthProvider `json:"github-copilot"`
+}
+
+// OpenCodeAuthProvider holds provider-specific auth details in OpenCode auth.json.
+type OpenCodeAuthProvider struct {
+	OAuthToken string `json:"oauth_token"`
+}
+
+// CopilotTokenResponse represents the Copilot token exchange response.
+type CopilotTokenResponse struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// CopilotUserResponse represents the relevant fields from copilot_internal/user.
+type CopilotUserResponse struct {
+	QuotaSnapshots struct {
+		PremiumInteractions struct {
+			Remaining        int     `json:"remaining"`
+			Entitlement      int     `json:"entitlement"`
+			PercentRemaining float64 `json:"percent_remaining"`
+		} `json:"premium_interactions"`
+	} `json:"quota_snapshots"`
+	QuotaResetDate string `json:"quota_reset_date"`
+}
+
 // DashboardData holds all data displayed on the dashboard.
 type DashboardData struct {
 	ProviderID ProviderID
@@ -183,6 +226,13 @@ type DashboardData struct {
 	WeeklyUtil     float64
 	WeeklyResets   time.Time
 	HasWeeklyData  bool
+
+	// OpenCode quota detail fields
+	QuotaUsed        int
+	QuotaEntitlement int
+	QuotaProjected   int
+	QuotaDaysLeft    int
+	QuotaPace        string
 
 	// ccusage - today
 	DailyCost   float64

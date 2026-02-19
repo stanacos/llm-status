@@ -1,6 +1,6 @@
 # llm-status
 
-`llm-status` is a terminal dashboard for Claude Code and OpenAI Codex usage. It shows rate-limit utilization and reset times, daily/30-day cost and token totals, and provider CLI version.
+`llm-status` is a terminal dashboard for Claude Code, OpenAI Codex, and OpenCode usage. It shows provider-specific session/weekly utilization and reset data, daily/30-day cost and token totals, provider quota data, and provider CLI version.
 
 ## Install
 
@@ -24,7 +24,9 @@ https://github.com/stanacos/llm-status/releases
 
 - Claude provider data: `claude` CLI installed/authenticated (`~/.claude/.credentials.json`).
 - Codex provider data: `codex` CLI installed and session logs in `~/.codex/sessions/*.jsonl`.
-- Node.js with `npx` is required for full functionality (`ccusage` and `@ccusage/codex` are run via `npx`).
+- OpenCode provider data: `opencode` CLI installed/authenticated and auth at `~/.local/share/opencode/auth.json` (or `$OPENCODE_DATA_DIR/auth.json`).
+- OpenCode quota data requires GitHub API access (`api.github.com` Copilot endpoints).
+- Node.js with `npx` is required for full functionality (`ccusage`, `@ccusage/codex`, and `@ccusage/opencode` are run via `npx`).
 - Homebrew installs Node.js automatically as a dependency for `llm-status`.
 - If installed without Homebrew and `npx` is unavailable, the app still works for rate-limit/version data; cost panels remain unavailable (`N/A`).
 
@@ -41,7 +43,7 @@ Keybindings:
 - `q`: quit
 - `r`: refresh now
 - `p`: open provider chooser
-- `w`: warm up current provider and refresh
+- `w`: warm up current provider (Claude/Codex/OpenCode) and refresh
 
 Provider chooser controls: `↑/↓` (or `j/k`) and `Enter`.
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,12 +29,22 @@ const (
 	weeklyWindow      = 7 * 24 * time.Hour
 	resetPastGrace    = 2 * time.Minute
 	warmUpTimeout     = 45 * time.Second
+	copilotTokenURL   = "https://api.github.com/copilot_internal/v2/token"
+	copilotUserURL    = "https://api.github.com/copilot_internal/user"
+	copilotTimeout    = 10 * time.Second
+
+	httpErrorExcerptLimit = 512
 )
 
 var (
 	errNoTokenCount      = errors.New("no token_count event found")
 	errTokenCountPending = errors.New("token_count event found but rate limits are not initialized")
 	warmUpCommandRunner  = runCommand
+
+	fetchCopilotQuotaFunc        = fetchCopilotQuota
+	fetchOpenCodeCcusageFunc     = fetchOpenCodeCcusage
+	fetchOpenCodeVersionFunc     = fetchOpenCodeVersion
+	openCodeVersionCommandRunner = runCommand
 )
 
 const (
@@ -110,6 +121,8 @@ func fetchAllDataForProvider(provider ProviderID) DashboardData {
 		return fetchClaudeData()
 	case ProviderCodex:
 		return fetchCodexData()
+	case ProviderOpenCode:
+		return fetchOpenCodeData()
 	default:
 		return DashboardData{
 			ProviderID:  provider,
@@ -259,6 +272,321 @@ func fetchCodexData() DashboardData {
 	wg.Wait()
 	data.LastUpdated = time.Now()
 	return data
+}
+
+func fetchOpenCodeData() DashboardData {
+	data := DashboardData{ProviderID: ProviderOpenCode}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	wg.Add(3)
+
+	// Copilot quota.
+	go func() {
+		defer wg.Done()
+		quotaData, err := fetchCopilotQuotaFunc()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "quota: "+err.Error())
+			return
+		}
+		if quotaData.HasSessionData {
+			data.SessionUtil = quotaData.SessionUtil
+			data.SessionResets = quotaData.SessionResets
+			data.HasSessionData = true
+		}
+		if quotaData.HasWeeklyData {
+			data.WeeklyUtil = quotaData.WeeklyUtil
+			data.WeeklyResets = quotaData.WeeklyResets
+			data.HasWeeklyData = true
+		}
+		if quotaData.HasSessionData || quotaData.HasWeeklyData {
+			data.QuotaUsed = quotaData.QuotaUsed
+			data.QuotaEntitlement = quotaData.QuotaEntitlement
+			data.QuotaProjected = quotaData.QuotaProjected
+			data.QuotaDaysLeft = quotaData.QuotaDaysLeft
+			data.QuotaPace = quotaData.QuotaPace
+		}
+	}()
+
+	// OpenCode cost + tokens from @ccusage/opencode.
+	go func() {
+		defer wg.Done()
+		result, err := fetchOpenCodeCcusageFunc()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "ccusage/opencode: "+err.Error())
+			return
+		}
+		if result.hasDailyData {
+			data.DailyCost = result.dailyCost
+			data.DailyTokens = result.dailyTokens
+			data.HasCostData = true
+		}
+		if result.hasMonthlyData {
+			data.MonthlyCost = result.monthlyCost
+			data.MonthlyTokens = result.monthlyTokens
+			data.HasMonthlyData = true
+		}
+	}()
+
+	// OpenCode CLI version.
+	go func() {
+		defer wg.Done()
+		version, err := fetchOpenCodeVersionFunc()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.Errors = append(data.Errors, "version: "+err.Error())
+			return
+		}
+		data.ProviderVersion = version
+		data.HasVersionData = true
+	}()
+
+	wg.Wait()
+	data.LastUpdated = time.Now()
+	return data
+}
+
+func readOpenCodeAuth() (string, error) {
+	var authPath string
+	if dataDir := strings.TrimSpace(os.Getenv("OPENCODE_DATA_DIR")); dataDir != "" {
+		authPath = filepath.Join(dataDir, "auth.json")
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve opencode auth path: home dir: %w", err)
+		}
+		authPath = filepath.Join(home, ".local", "share", "opencode", "auth.json")
+	}
+
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		return "", fmt.Errorf("read opencode auth file %s: %w", authPath, err)
+	}
+
+	var authFile OpenCodeAuthFile
+	if err := json.Unmarshal(raw, &authFile); err != nil {
+		return "", fmt.Errorf("parse opencode auth file %s: %w", authPath, err)
+	}
+
+	oauthToken := strings.TrimSpace(authFile.GitHubCopilot.OAuthToken)
+	if oauthToken == "" {
+		return "", fmt.Errorf("opencode auth file %s missing github-copilot oauth token", authPath)
+	}
+
+	return oauthToken, nil
+}
+
+func exchangeCopilotToken(oauthToken string) (string, error) {
+	if strings.TrimSpace(oauthToken) == "" {
+		return "", fmt.Errorf("copilot oauth token is empty")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotTokenURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create copilot token request: %w", err)
+	}
+	req.Header.Set("Authorization", "token "+oauthToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
+
+	client := &http.Client{Timeout: copilotTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("copilot token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
+		if excerpt != "" {
+			return "", fmt.Errorf("copilot token exchange returned %d: %s", resp.StatusCode, excerpt)
+		}
+		return "", fmt.Errorf("copilot token exchange returned %d", resp.StatusCode)
+	}
+
+	var tokenResp CopilotTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("parse copilot token response: %w", err)
+	}
+
+	sessionToken := strings.TrimSpace(tokenResp.Token)
+	if sessionToken == "" {
+		return "", fmt.Errorf("copilot token response missing token")
+	}
+
+	return sessionToken, nil
+}
+
+func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
+	if strings.TrimSpace(sessionToken) == "" {
+		return nil, fmt.Errorf("copilot session token is empty")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotUserURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create copilot user request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+sessionToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
+	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
+
+	client := &http.Client{Timeout: copilotTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("copilot user request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
+		if excerpt != "" {
+			return nil, fmt.Errorf("copilot user API returned %d: %s", resp.StatusCode, excerpt)
+		}
+		return nil, fmt.Errorf("copilot user API returned %d", resp.StatusCode)
+	}
+
+	var userResp CopilotUserResponse
+	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
+		return nil, fmt.Errorf("parse copilot user response: %w", err)
+	}
+
+	return &userResp, nil
+}
+
+func calculateQuotaProjection(used int, entitlement int, now time.Time) (projected int, daysLeft int, pace string) {
+	if used < 0 {
+		used = 0
+	}
+	if entitlement < 0 {
+		entitlement = 0
+	}
+
+	daysElapsed := now.Day()
+	if daysElapsed < 1 {
+		daysElapsed = 1
+	}
+
+	year, month, _ := now.Date()
+	daysInMonth := time.Date(year, month+1, 0, 0, 0, 0, 0, now.Location()).Day()
+
+	rawProjected := int(math.Round((float64(used) / float64(daysElapsed)) * float64(daysInMonth)))
+	if rawProjected < 0 {
+		rawProjected = 0
+	}
+
+	daysLeft = daysInMonth - now.Day()
+	if daysLeft < 0 {
+		daysLeft = 0
+	}
+
+	pace = "on track"
+	if rawProjected > entitlement {
+		pace = "exceeding"
+	}
+
+	projected = rawProjected
+	if projected > entitlement {
+		projected = entitlement
+	}
+
+	return projected, daysLeft, pace
+}
+
+func fetchCopilotQuota() (DashboardData, error) {
+	oauthToken, err := readOpenCodeAuth()
+	if err != nil {
+		return DashboardData{}, err
+	}
+
+	sessionToken, err := exchangeCopilotToken(oauthToken)
+	if err != nil {
+		return DashboardData{}, err
+	}
+
+	userResp, err := fetchCopilotUser(sessionToken)
+	if err != nil {
+		return DashboardData{}, err
+	}
+
+	resetAt, err := time.ParseInLocation("2006-01-02", userResp.QuotaResetDate, time.Local)
+	if err != nil {
+		return DashboardData{}, fmt.Errorf("parse quota reset date %q: %w", userResp.QuotaResetDate, err)
+	}
+
+	entitlement := userResp.QuotaSnapshots.PremiumInteractions.Entitlement
+	if entitlement < 0 {
+		entitlement = 0
+	}
+
+	used := entitlement - userResp.QuotaSnapshots.PremiumInteractions.Remaining
+	if used < 0 {
+		used = 0
+	}
+
+	projected, daysLeft, pace := calculateQuotaProjection(used, entitlement, time.Now())
+
+	usedPercent := 0.0
+	projectedPercent := 0.0
+	if entitlement > 0 {
+		usedPercent = (float64(used) / float64(entitlement)) * 100
+		projectedPercent = (float64(projected) / float64(entitlement)) * 100
+	}
+
+	return DashboardData{
+		ProviderID:       ProviderOpenCode,
+		SessionUtil:      usedPercent,
+		SessionResets:    resetAt,
+		HasSessionData:   true,
+		WeeklyUtil:       projectedPercent,
+		WeeklyResets:     resetAt,
+		HasWeeklyData:    true,
+		QuotaUsed:        used,
+		QuotaEntitlement: entitlement,
+		QuotaProjected:   projected,
+		QuotaDaysLeft:    daysLeft,
+		QuotaPace:        pace,
+	}, nil
+}
+
+func readHTTPErrorExcerpt(body io.Reader, limit int64) string {
+	if body == nil {
+		return ""
+	}
+	if limit <= 0 {
+		limit = httpErrorExcerptLimit
+	}
+
+	// Read a bounded slice for safe, compact error reporting.
+	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil || len(buf) == 0 {
+		return ""
+	}
+
+	truncated := int64(len(buf)) > limit
+	if truncated {
+		buf = buf[:limit]
+	}
+
+	excerpt := strings.Join(strings.Fields(string(buf)), " ")
+	if excerpt == "" {
+		return ""
+	}
+	if truncated {
+		return excerpt + "..."
+	}
+	return excerpt
 }
 
 func fetchCodexStatusFromLogs() (*codexStatusSnapshot, error) {
@@ -780,6 +1108,50 @@ func fetchCodexCcusage() (*costResult, error) {
 	return result, nil
 }
 
+// fetchOpenCodeCcusage runs @ccusage/opencode for the last 30 days and extracts today + totals.
+func fetchOpenCodeCcusage() (*costResult, error) {
+	since := time.Now().AddDate(0, 0, -30).Format("20060102")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	output, err := runCommand(
+		ctx,
+		"npx",
+		"@ccusage/opencode@latest",
+		"daily",
+		"--json",
+		"--since",
+		since,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("run @ccusage/opencode: %w", err)
+	}
+
+	var parsed CcusageOutput
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		return nil, fmt.Errorf("parse @ccusage/opencode output: %w", err)
+	}
+
+	result := &costResult{
+		monthlyCost:    parsed.Totals.TotalCost,
+		monthlyTokens:  parsed.Totals.TotalTokens,
+		hasMonthlyData: true,
+	}
+
+	today := time.Now().Format("2006-01-02")
+	for _, entry := range parsed.Daily {
+		if entry.Date == today {
+			result.dailyCost = entry.TotalCost
+			result.dailyTokens = entry.TotalTokens
+			result.hasDailyData = true
+			break
+		}
+	}
+
+	return result, nil
+}
+
 func localTimezone() string {
 	tz := strings.TrimSpace(os.Getenv("TZ"))
 	if tz != "" {
@@ -835,12 +1207,35 @@ func fetchCodexVersion() (string, error) {
 	return raw, nil
 }
 
+// fetchOpenCodeVersion runs `opencode version` and parses the version string.
+func fetchOpenCodeVersion() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	output, err := openCodeVersionCommandRunner(ctx, "opencode", "version")
+	if err != nil {
+		return "", fmt.Errorf("run opencode version: %w", err)
+	}
+
+	raw := strings.TrimSpace(string(output))
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return raw, nil
+	}
+	if len(fields) >= 2 && strings.EqualFold(fields[0], "opencode") {
+		return fields[1], nil
+	}
+	return fields[0], nil
+}
+
 func warmUpProvider(provider ProviderID) error {
 	switch provider {
 	case ProviderClaude:
 		return warmUpClaude()
 	case ProviderCodex:
 		return warmUpCodex()
+	case ProviderOpenCode:
+		return warmUpOpenCode()
 	default:
 		return fmt.Errorf("unknown provider %q", provider)
 	}
@@ -862,6 +1257,16 @@ func warmUpCodex() error {
 
 	if _, err := warmUpCommandRunner(ctx, "codex", "exec", "--skip-git-repo-check", codexWarmUpPrompt); err != nil {
 		return fmt.Errorf("codex warm-up failed: %w", err)
+	}
+	return nil
+}
+
+func warmUpOpenCode() error {
+	ctx, cancel := context.WithTimeout(context.Background(), warmUpTimeout)
+	defer cancel()
+
+	if _, err := warmUpCommandRunner(ctx, "opencode", "version"); err != nil {
+		return fmt.Errorf("opencode warm-up failed: %w", err)
 	}
 	return nil
 }
