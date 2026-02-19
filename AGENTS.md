@@ -57,3 +57,56 @@ Do not commit secrets or personal usage artifacts.
 - Codex usage/status source: `~/.codex/sessions/*.jsonl`.
 - App config: `~/.llm-status/config.json`.
 - External tools invoked: `claude --version`, `codex --version`, `npx ccusage@latest`, `npx @ccusage/codex@latest`.
+
+## Recent Delivered Changes (2026-02-19)
+
+### v0.1.1 (`8f8f86f`)
+- Fixed first-start reset-time glitches where session reset could show stale/implausible values.
+- Added timestamp normalization for Codex `resets_at` values (supports Unix seconds and milliseconds).
+- Added plausibility guards for session/weekly reset windows.
+- Changed Codex startup parsing to avoid fallback to stale older session files when newest file has `token_count` but uninitialized rate limits.
+- Added regression tests in `fetch_test.go` for pending token_count behavior, fallback behavior, and timestamp/plausibility parsing.
+- Updated README Homebrew tap command to `stanacos/homebrew-tap`.
+- Released via tag `v0.1.1`; GitHub Release and Homebrew formula updated automatically by GoReleaser.
+
+### v0.1.2 (`5a6e65f`)
+- Added provider-specific manual warm-up key `w` in dashboard footer:
+  - Claude provider: silent non-interactive warm-up via `claude -p`.
+  - Codex provider: silent non-interactive warm-up via `codex exec`.
+- Warm-up runs only for the currently selected provider and triggers an immediate refresh when complete.
+- Added warm-up completion Bubble Tea message type (`warmupFinishedMsg`) and model handling.
+- Removed footer `Next` refresh countdown text to reduce UI clutter.
+- Updated README keybindings with `w`.
+- Added tests in `model_test.go` and `fetch_test.go` for warm-up dispatch, update-loop behavior, footer rendering, and error handling.
+- Delivered with PR #3 and released via tag `v0.1.2`; Homebrew formula updated and verified through `brew upgrade`.
+
+## Release / Homebrew Runbook
+
+Use this flow for future versions.
+
+1. Create feature branch from `main`.
+2. Implement changes and tests.
+3. Run:
+   - `make vet`
+   - `make test`
+   - `make build`
+4. Commit using conventional format (`feat: ...`, `fix: ...`, etc.).
+5. Push branch and open PR against `main`.
+6. Wait for CI (`.github/workflows/ci.yml`) to pass.
+7. Merge PR to `main`.
+8. Pull latest `main` locally.
+9. Create annotated version tag:
+   - `git tag -a vX.Y.Z -m "<summary>"`
+10. Push tag:
+   - `git push origin vX.Y.Z`
+11. Verify release workflow (`.github/workflows/release.yml`) succeeds.
+12. Verify GitHub Release assets exist for all targets and `checksums.txt`.
+13. Verify Homebrew tap formula (`stanacos/homebrew-tap`) is updated to `X.Y.Z`.
+14. Verify end-user upgrade path:
+   - `brew update`
+   - `brew upgrade llm-status`
+   - `llm-status --version`
+
+Notes:
+- Tag pushes (`v*`) are the release trigger.
+- Homebrew publishing relies on `HOMEBREW_TAP_GITHUB_TOKEN`.
