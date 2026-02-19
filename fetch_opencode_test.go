@@ -27,6 +27,18 @@ func TestReadOpenCodeAuth(t *testing.T) {
 			wantToken: "token-123",
 		},
 		{
+			name: "valid auth file with access key",
+			setup: func(t *testing.T, homeDir string) {
+				t.Helper()
+				writeOpenCodeAuthFixture(
+					t,
+					filepath.Join(homeDir, ".local", "share", "opencode", "auth.json"),
+					`{"github-copilot":{"access":"token-abc","refresh":"r","expires":"2026-03-01T00:00:00Z","type":"bearer"}}`,
+				)
+			},
+			wantToken: "token-abc",
+		},
+		{
 			name: "missing file",
 			setup: func(_ *testing.T, _ string) {
 			},
@@ -333,14 +345,14 @@ func TestFetchOpenCodeVersion(t *testing.T) {
 		{
 			name:     "unexpected format",
 			output:   []byte("version=0.4.2 build=abc123\n"),
-			want:     "version=0.4.2",
+			want:     "0.4.2",
 			wantName: "opencode",
 			wantArgs: []string{"version"},
 		},
 		{
 			name:     "command failure wrapping",
 			runErr:   errors.New("boom"),
-			wantErr:  "run opencode version: boom",
+			wantErr:  "run opencode --version: boom",
 			wantName: "opencode",
 			wantArgs: []string{"version"},
 		},
@@ -349,15 +361,17 @@ func TestFetchOpenCodeVersion(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			var calls [][]string
 			openCodeVersionCommandRunner = func(_ context.Context, name string, args ...string) ([]byte, error) {
 				if name != tc.wantName {
 					t.Fatalf("command name: got %q, want %q", name, tc.wantName)
 				}
-				if got, want := strings.Join(args, "\x00"), strings.Join(tc.wantArgs, "\x00"); got != want {
-					t.Fatalf("command args: got %q, want %q", args, tc.wantArgs)
-				}
+				calls = append(calls, append([]string(nil), args...))
 				if tc.runErr != nil {
 					return nil, tc.runErr
+				}
+				if got, want := strings.Join(args, "\x00"), strings.Join(tc.wantArgs, "\x00"); got != want {
+					t.Fatalf("command args: got %q, want %q", args, tc.wantArgs)
 				}
 				return append([]byte(nil), tc.output...), nil
 			}
@@ -370,6 +384,17 @@ func TestFetchOpenCodeVersion(t *testing.T) {
 				if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("unexpected error: got %q, want substring %q", err.Error(), tc.wantErr)
 				}
+				if tc.runErr != nil {
+					if len(calls) != 2 {
+						t.Fatalf("expected 2 calls, got %d", len(calls))
+					}
+					if got, want := strings.Join(calls[0], "\x00"), strings.Join([]string{"version"}, "\x00"); got != want {
+						t.Fatalf("first call args: got %q, want %q", calls[0], []string{"version"})
+					}
+					if got, want := strings.Join(calls[1], "\x00"), strings.Join([]string{"--version"}, "\x00"); got != want {
+						t.Fatalf("second call args: got %q, want %q", calls[1], []string{"--version"})
+					}
+				}
 				return
 			}
 			if err != nil {
@@ -380,6 +405,127 @@ func TestFetchOpenCodeVersion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFetchOpenCodeVersionFallback(t *testing.T) {
+	originalRunner := openCodeVersionCommandRunner
+	defer func() {
+		openCodeVersionCommandRunner = originalRunner
+	}()
+
+	t.Run("falls back to --version when version output is not parseable", func(t *testing.T) {
+		var calls [][]string
+		openCodeVersionCommandRunner = func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name != "opencode" {
+				t.Fatalf("expected command opencode, got %q", name)
+			}
+			calls = append(calls, append([]string(nil), args...))
+			if len(calls) == 1 {
+				return []byte("OpenCode CLI\n"), nil
+			}
+			if len(calls) == 2 {
+				return []byte("v0.9.1\n"), nil
+			}
+			return nil, errors.New("too many calls")
+		}
+
+		got, err := fetchOpenCodeVersion()
+		if err != nil {
+			t.Fatalf("fetchOpenCodeVersion() unexpected error: %v", err)
+		}
+		if got != "0.9.1" {
+			t.Fatalf("version: got %q, want %q", got, "0.9.1")
+		}
+
+		if len(calls) != 2 {
+			t.Fatalf("expected 2 calls, got %d", len(calls))
+		}
+		if got, want := strings.Join(calls[0], "\x00"), strings.Join([]string{"version"}, "\x00"); got != want {
+			t.Fatalf("first call args: got %q, want %q", calls[0], []string{"version"})
+		}
+		if got, want := strings.Join(calls[1], "\x00"), strings.Join([]string{"--version"}, "\x00"); got != want {
+			t.Fatalf("second call args: got %q, want %q", calls[1], []string{"--version"})
+		}
+	})
+
+	t.Run("falls back to --version when version command errors", func(t *testing.T) {
+		var calls [][]string
+		openCodeVersionCommandRunner = func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name != "opencode" {
+				t.Fatalf("expected command opencode, got %q", name)
+			}
+			calls = append(calls, append([]string(nil), args...))
+			if len(calls) == 1 {
+				return nil, errors.New("version subcommand missing")
+			}
+			if len(calls) == 2 {
+				return []byte("1.2.6\n"), nil
+			}
+			return nil, errors.New("too many calls")
+		}
+
+		got, err := fetchOpenCodeVersion()
+		if err != nil {
+			t.Fatalf("fetchOpenCodeVersion() unexpected error: %v", err)
+		}
+		if got != "1.2.6" {
+			t.Fatalf("version: got %q, want %q", got, "1.2.6")
+		}
+		if len(calls) != 2 {
+			t.Fatalf("expected 2 calls, got %d", len(calls))
+		}
+		if got, want := strings.Join(calls[0], "\x00"), strings.Join([]string{"version"}, "\x00"); got != want {
+			t.Fatalf("first call args: got %q, want %q", calls[0], []string{"version"})
+		}
+		if got, want := strings.Join(calls[1], "\x00"), strings.Join([]string{"--version"}, "\x00"); got != want {
+			t.Fatalf("second call args: got %q, want %q", calls[1], []string{"--version"})
+		}
+	})
+
+	t.Run("returns parse error when neither command has a version", func(t *testing.T) {
+		openCodeVersionCommandRunner = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte("OpenCode CLI\n"), nil
+		}
+
+		_, err := fetchOpenCodeVersion()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "unable to parse opencode version output") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestParseCcusageOutput(t *testing.T) {
+	t.Run("parses pure json", func(t *testing.T) {
+		output := []byte(`{"totals":{"totalCost":1.5,"totalTokens":2000},"daily":[{"date":"2026-02-19","totalCost":0.5,"totalTokens":1000}]}`)
+		parsed, err := parseCcusageOutput(output)
+		if err != nil {
+			t.Fatalf("parseCcusageOutput() unexpected error: %v", err)
+		}
+		if parsed.Totals.TotalCost != 1.5 || parsed.Totals.TotalTokens != 2000 {
+			t.Fatalf("unexpected totals: %+v", parsed.Totals)
+		}
+	})
+
+	t.Run("parses json with npx prefix lines", func(t *testing.T) {
+		output := []byte("Need to install the following packages:\n@ccusage/opencode@latest\n{\"totals\":{\"totalCost\":2.75,\"totalTokens\":3000},\"daily\":[]}\n")
+		parsed, err := parseCcusageOutput(output)
+		if err != nil {
+			t.Fatalf("parseCcusageOutput() unexpected error: %v", err)
+		}
+		if parsed.Totals.TotalCost != 2.75 || parsed.Totals.TotalTokens != 3000 {
+			t.Fatalf("unexpected totals: %+v", parsed.Totals)
+		}
+	})
+
+	t.Run("returns error when no json present", func(t *testing.T) {
+		_, err := parseCcusageOutput([]byte("@ccusage/opencode@latest\n"))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func TestFetchOpenCodeDataMergesAllSources(t *testing.T) {
