@@ -12,10 +12,12 @@ const (
 	configDirName       = ".llm-status"
 	legacyConfigDirName = ".claude-status"
 	configFileName      = "config.json"
+	configVersion       = 1
 )
 
 type appConfig struct {
-	LastProvider ProviderID `json:"last_provider"`
+	ConfigVersion int        `json:"config_version,omitempty"`
+	LastProvider  ProviderID `json:"last_provider"`
 }
 
 func loadLastProvider() (ProviderID, error) {
@@ -60,7 +62,10 @@ func saveLastProvider(provider ProviderID) error {
 		return err
 	}
 
-	content, err := json.MarshalIndent(appConfig{LastProvider: provider}, "", "  ")
+	content, err := json.MarshalIndent(appConfig{
+		ConfigVersion: configVersion,
+		LastProvider:  provider,
+	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -87,7 +92,7 @@ func loadProviderFromPath(path string) (ProviderID, bool, error) {
 	}
 
 	if !isValidProvider(cfg.LastProvider) {
-		return "", true, nil
+		return "", false, nil
 	}
 	return cfg.LastProvider, true, nil
 }

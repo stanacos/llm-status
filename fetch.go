@@ -35,12 +35,17 @@ const (
 	copilotTimeout    = 10 * time.Second
 
 	httpErrorExcerptLimit = 512
+	costCacheTTL          = 10 * time.Minute
+	versionCacheTTL       = 30 * time.Minute
+	quotaCacheTTL         = 5 * time.Minute
+	cacheFailureRetryTTL  = 1 * time.Minute
 )
 
 var (
 	errNoTokenCount      = errors.New("no token_count event found")
 	errTokenCountPending = errors.New("token_count event found but rate limits are not initialized")
 	warmUpCommandRunner  = runCommand
+	nowFunc              = time.Now
 
 	fetchCopilotQuotaFunc        = fetchCopilotQuota
 	fetchOpenCodeCcusageFunc     = fetchOpenCodeCcusage
@@ -50,6 +55,7 @@ var (
 	readOpenCodeAuthFunc         = readOpenCodeAuth
 	exchangeCopilotTokenFunc     = exchangeCopilotToken
 	fetchCopilotUserFunc         = fetchCopilotUser
+	resourceCaches               = newProviderResourceCaches()
 )
 
 const (
@@ -119,6 +125,134 @@ type codexStatusSnapshot struct {
 	weeklyEnds  time.Time
 }
 
+type cachedValue[T any] struct {
+	mu       sync.Mutex
+	value    T
+	hasValue bool
+	expires  time.Time
+	inFlight bool
+	waitCh   chan struct{}
+}
+
+func (c *cachedValue[T]) get(ttl time.Duration, fetch func() (T, error)) (T, bool, error) {
+	for {
+		now := nowFunc()
+
+		c.mu.Lock()
+		if c.hasValue && now.Before(c.expires) {
+			value := c.value
+			c.mu.Unlock()
+			return value, false, nil
+		}
+		if c.inFlight {
+			waitCh := c.waitCh
+			c.mu.Unlock()
+			<-waitCh
+			continue
+		}
+
+		c.inFlight = true
+		c.waitCh = make(chan struct{})
+		waitCh := c.waitCh
+		staleValue := c.value
+		hasStale := c.hasValue
+		c.mu.Unlock()
+
+		freshValue, err := fetch()
+		finishedAt := nowFunc()
+
+		c.mu.Lock()
+		if err == nil {
+			c.value = freshValue
+			c.hasValue = true
+			c.expires = finishedAt.Add(ttl)
+			c.inFlight = false
+			close(waitCh)
+			c.waitCh = nil
+			c.mu.Unlock()
+			return freshValue, false, nil
+		}
+
+		if hasStale {
+			c.expires = finishedAt.Add(cacheFailureRetryTTL)
+		}
+		c.inFlight = false
+		close(waitCh)
+		c.waitCh = nil
+		c.mu.Unlock()
+
+		if hasStale {
+			return staleValue, true, err
+		}
+		var zero T
+		return zero, false, err
+	}
+}
+
+type providerResourceCaches struct {
+	costByProvider    map[ProviderID]*cachedValue[costResult]
+	versionByProvider map[ProviderID]*cachedValue[string]
+	openCodeQuota     *cachedValue[DashboardData]
+}
+
+func newProviderResourceCaches() *providerResourceCaches {
+	return &providerResourceCaches{
+		costByProvider: map[ProviderID]*cachedValue[costResult]{
+			ProviderClaude:   &cachedValue[costResult]{},
+			ProviderCodex:    &cachedValue[costResult]{},
+			ProviderOpenCode: &cachedValue[costResult]{},
+		},
+		versionByProvider: map[ProviderID]*cachedValue[string]{
+			ProviderClaude:   &cachedValue[string]{},
+			ProviderCodex:    &cachedValue[string]{},
+			ProviderOpenCode: &cachedValue[string]{},
+		},
+		openCodeQuota: &cachedValue[DashboardData]{},
+	}
+}
+
+func resetResourceCaches() {
+	resourceCaches = newProviderResourceCaches()
+}
+
+func getCachedCost(provider ProviderID, fetch func() (*costResult, error)) (*costResult, bool, error) {
+	cache, ok := resourceCaches.costByProvider[provider]
+	if !ok {
+		return nil, false, fmt.Errorf("no cost cache configured for provider %q", provider)
+	}
+
+	result, stale, err := cache.get(costCacheTTL, func() (costResult, error) {
+		fetched, fetchErr := fetch()
+		if fetchErr != nil {
+			return costResult{}, fetchErr
+		}
+		if fetched == nil {
+			return costResult{}, fmt.Errorf("empty cost result")
+		}
+		return *fetched, nil
+	})
+	if err != nil && !stale {
+		return nil, false, err
+	}
+	return &result, stale, err
+}
+
+func getCachedVersion(provider ProviderID, fetch func() (string, error)) (string, bool, error) {
+	cache, ok := resourceCaches.versionByProvider[provider]
+	if !ok {
+		return "", false, fmt.Errorf("no version cache configured for provider %q", provider)
+	}
+	return cache.get(versionCacheTTL, fetch)
+}
+
+func getCachedOpenCodeQuota(fetch func() (DashboardData, error)) (DashboardData, bool, error) {
+	data, stale, err := resourceCaches.openCodeQuota.get(quotaCacheTTL, fetch)
+	if err != nil && !stale {
+		return DashboardData{}, false, err
+	}
+	return data, stale, err
+}
+
 // fetchAllDataForProvider fetches provider-specific dashboard data.
 func fetchAllDataForProvider(provider ProviderID) DashboardData {
 	switch provider {
@@ -170,11 +304,19 @@ func fetchClaudeData() DashboardData {
 	// ccusage cost + tokens (30-day window, extract today from daily array)
 	go func() {
 		defer wg.Done()
-		result, err := fetchClaudeCcusage()
+		result, stale, err := getCachedCost(ProviderClaude, fetchClaudeCcusage)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "ccusage: "+err.Error())
+			if stale {
+				data.Errors = append(data.Errors, "ccusage: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "ccusage: "+err.Error())
+				return
+			}
+		}
+		if result == nil {
+			data.Errors = append(data.Errors, "ccusage: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -192,12 +334,16 @@ func fetchClaudeData() DashboardData {
 	// Claude Code version
 	go func() {
 		defer wg.Done()
-		version, err := fetchClaudeVersion()
+		version, stale, err := getCachedVersion(ProviderClaude, fetchClaudeVersion)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "version: "+err.Error())
-			return
+			if stale {
+				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "version: "+err.Error())
+				return
+			}
 		}
 		data.ProviderVersion = version
 		data.HasVersionData = true
@@ -241,11 +387,19 @@ func fetchCodexData() DashboardData {
 	// Codex cost + tokens from @ccusage/codex.
 	go func() {
 		defer wg.Done()
-		result, err := fetchCodexCcusage()
+		result, stale, err := getCachedCost(ProviderCodex, fetchCodexCcusage)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "ccusage/codex: "+err.Error())
+			if stale {
+				data.Errors = append(data.Errors, "ccusage/codex: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "ccusage/codex: "+err.Error())
+				return
+			}
+		}
+		if result == nil {
+			data.Errors = append(data.Errors, "ccusage/codex: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -263,12 +417,16 @@ func fetchCodexData() DashboardData {
 	// Codex CLI version.
 	go func() {
 		defer wg.Done()
-		version, err := fetchCodexVersion()
+		version, stale, err := getCachedVersion(ProviderCodex, fetchCodexVersion)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "version: "+err.Error())
-			return
+			if stale {
+				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "version: "+err.Error())
+				return
+			}
 		}
 		data.ProviderVersion = version
 		data.HasVersionData = true
@@ -289,12 +447,16 @@ func fetchOpenCodeData() DashboardData {
 	// Copilot quota.
 	go func() {
 		defer wg.Done()
-		quotaData, err := fetchCopilotQuotaFunc()
+		quotaData, stale, err := getCachedOpenCodeQuota(fetchCopilotQuotaFunc)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "quota: "+err.Error())
-			return
+			if stale {
+				data.Errors = append(data.Errors, "quota: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "quota: "+err.Error())
+				return
+			}
 		}
 		if quotaData.HasSessionData {
 			data.SessionUtil = quotaData.SessionUtil
@@ -313,16 +475,27 @@ func fetchOpenCodeData() DashboardData {
 			data.QuotaDaysLeft = quotaData.QuotaDaysLeft
 			data.QuotaPace = quotaData.QuotaPace
 		}
+		if len(quotaData.Errors) > 0 {
+			data.Errors = append(data.Errors, quotaData.Errors...)
+		}
 	}()
 
 	// OpenCode cost + tokens from @ccusage/opencode.
 	go func() {
 		defer wg.Done()
-		result, err := fetchOpenCodeCcusageFunc()
+		result, stale, err := getCachedCost(ProviderOpenCode, fetchOpenCodeCcusageFunc)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "ccusage/opencode: "+err.Error())
+			if stale {
+				data.Errors = append(data.Errors, "ccusage/opencode: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "ccusage/opencode: "+err.Error())
+				return
+			}
+		}
+		if result == nil {
+			data.Errors = append(data.Errors, "ccusage/opencode: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -340,12 +513,16 @@ func fetchOpenCodeData() DashboardData {
 	// OpenCode CLI version.
 	go func() {
 		defer wg.Done()
-		version, err := fetchOpenCodeVersionFunc()
+		version, stale, err := getCachedVersion(ProviderOpenCode, fetchOpenCodeVersionFunc)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "version: "+err.Error())
-			return
+			if stale {
+				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+			} else {
+				data.Errors = append(data.Errors, "version: "+err.Error())
+				return
+			}
 		}
 		data.ProviderVersion = version
 		data.HasVersionData = true
@@ -576,9 +753,12 @@ func fetchCopilotQuota() (DashboardData, error) {
 		}
 	}
 
-	resetAt, err := time.ParseInLocation("2006-01-02", userResp.QuotaResetDate, time.Local)
-	if err != nil {
-		return DashboardData{}, fmt.Errorf("parse quota reset date %q: %w", userResp.QuotaResetDate, err)
+	now := nowFunc()
+	resetAt, resetErr := parseQuotaResetDate(userResp.QuotaResetDate, now)
+	var warnings []string
+	if resetErr != nil {
+		warnings = append(warnings, "quota reset date: "+resetErr.Error())
+		resetAt = now
 	}
 
 	entitlement := userResp.QuotaSnapshots.PremiumInteractions.Entitlement
@@ -591,7 +771,7 @@ func fetchCopilotQuota() (DashboardData, error) {
 		used = 0
 	}
 
-	projected, daysLeft, pace := calculateQuotaProjection(used, entitlement, time.Now())
+	projected, daysLeft, pace := calculateQuotaProjection(used, entitlement, now)
 
 	usedPercent := 0.0
 	projectedPercent := 0.0
@@ -613,7 +793,35 @@ func fetchCopilotQuota() (DashboardData, error) {
 		QuotaProjected:   projected,
 		QuotaDaysLeft:    daysLeft,
 		QuotaPace:        pace,
+		Errors:           warnings,
 	}, nil
+}
+
+func parseQuotaResetDate(raw string, fallback time.Time) (time.Time, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fallback, fmt.Errorf("empty value")
+	}
+
+	if t, err := time.ParseInLocation("2006-01-02", value, time.Local); err == nil {
+		return t, nil
+	}
+
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t.In(time.Local), nil
+		}
+		if t, err := time.ParseInLocation(layout, value, time.Local); err == nil {
+			return t, nil
+		}
+	}
+
+	return fallback, fmt.Errorf("unsupported format %q", value)
 }
 
 func readHTTPErrorExcerpt(body io.Reader, limit int64) string {
@@ -734,61 +942,51 @@ func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	reader := bufio.NewReader(file)
 
 	var latest codexStatusSnapshot
 	found := false
 	sawTokenCount := false
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimSpace(line)
+		}
+		if len(line) > 0 {
+			var record codexLogLine
+			if err := json.Unmarshal(line, &record); err == nil {
+				if record.Type == "event_msg" && len(record.Payload) > 0 {
+					var evtType codexEventType
+					if err := json.Unmarshal(record.Payload, &evtType); err == nil && evtType.Type == "token_count" {
+						sawTokenCount = true
 
-		var record codexLogLine
-		if err := json.Unmarshal(line, &record); err != nil {
-			continue
-		}
-		if record.Type != "event_msg" || len(record.Payload) == 0 {
-			continue
-		}
+						var payload codexTokenCountPayload
+						if err := json.Unmarshal(record.Payload, &payload); err == nil {
+							snapshot := codexStatusSnapshot{}
+							applyCodexRateLimits(&snapshot, payload.RateLimits)
+							if snapshot.hasSession || snapshot.hasWeekly {
+								if ts, err := time.Parse(time.RFC3339Nano, record.Timestamp); err == nil {
+									snapshot.timestamp = ts
+								}
 
-		var evtType codexEventType
-		if err := json.Unmarshal(record.Payload, &evtType); err != nil {
-			continue
-		}
-		if evtType.Type != "token_count" {
-			continue
-		}
-		sawTokenCount = true
-
-		var payload codexTokenCountPayload
-		if err := json.Unmarshal(record.Payload, &payload); err != nil {
-			continue
-		}
-
-		snapshot := codexStatusSnapshot{}
-		applyCodexRateLimits(&snapshot, payload.RateLimits)
-		if !snapshot.hasSession && !snapshot.hasWeekly {
-			continue
-		}
-
-		if ts, err := time.Parse(time.RFC3339Nano, record.Timestamp); err == nil {
-			snapshot.timestamp = ts
+								if !found || latest.timestamp.IsZero() || snapshot.timestamp.After(latest.timestamp) {
+									latest = snapshot
+									found = true
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 
-		if !found {
-			latest = snapshot
-			found = true
-			continue
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-
-		if latest.timestamp.IsZero() || snapshot.timestamp.After(latest.timestamp) {
-			latest = snapshot
+		if readErr != nil {
+			return nil, fmt.Errorf("read codex log %s: %w", path, readErr)
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan codex log %s: %w", path, err)
 	}
 	if !found {
 		if sawTokenCount {
@@ -1070,7 +1268,8 @@ func checkNpxAvailable() error {
 
 // fetchClaudeCcusage runs ccusage for the last 30 days and extracts today + totals.
 func fetchClaudeCcusage() (*costResult, error) {
-	since := time.Now().AddDate(0, 0, -30).Format("20060102")
+	now := nowFunc()
+	since := now.AddDate(0, 0, -30).Format("20060102")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1092,7 +1291,7 @@ func fetchClaudeCcusage() (*costResult, error) {
 	}
 
 	// Find today's entry in the daily array
-	today := time.Now().Format("2006-01-02")
+	today := now.Format("2006-01-02")
 	for _, entry := range parsed.Daily {
 		if entry.Date == today {
 			result.dailyCost = entry.TotalCost
@@ -1108,31 +1307,35 @@ func fetchClaudeCcusage() (*costResult, error) {
 // fetchCodexCcusage runs @ccusage/codex for the last 30 days and extracts today + totals.
 func fetchCodexCcusage() (*costResult, error) {
 	timezone := localTimezone()
-	location, err := time.LoadLocation(timezone)
-	if err != nil {
-		timezone = "UTC"
-		location = time.UTC
+	location := time.Local
+	if timezone != "" {
+		loadedLocation, err := time.LoadLocation(timezone)
+		if err != nil {
+			timezone = ""
+		} else {
+			location = loadedLocation
+		}
 	}
 
-	now := time.Now().In(location)
+	now := nowFunc().In(location)
 	since := now.AddDate(0, 0, -30).Format("20060102")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	output, err := runCommand(
-		ctx,
-		"npx",
+	args := []string{
 		"@ccusage/codex@latest",
 		"daily",
 		"--json",
 		"--since",
 		since,
-		"--timezone",
-		timezone,
-		"--locale",
-		"en-US",
-	)
+	}
+	if timezone != "" {
+		args = append(args, "--timezone", timezone)
+	}
+	args = append(args, "--locale", "en-US")
+
+	output, err := runCommand(ctx, "npx", args...)
 	if err != nil {
 		return nil, fmt.Errorf("run @ccusage/codex: %w", err)
 	}
@@ -1166,7 +1369,8 @@ func fetchCodexCcusage() (*costResult, error) {
 
 // fetchOpenCodeCcusage runs @ccusage/opencode for the last 30 days and extracts today + totals.
 func fetchOpenCodeCcusage() (*costResult, error) {
-	since := time.Now().AddDate(0, 0, -30).Format("20060102")
+	now := nowFunc()
+	since := now.AddDate(0, 0, -30).Format("20060102")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1196,7 +1400,7 @@ func fetchOpenCodeCcusage() (*costResult, error) {
 		hasMonthlyData: true,
 	}
 
-	today := time.Now().Format("2006-01-02")
+	today := now.Format("2006-01-02")
 	for _, entry := range parsed.Daily {
 		if entry.Date == today {
 			result.dailyCost = entry.TotalCost
@@ -1231,16 +1435,42 @@ func parseCcusageOutput(output []byte) (*CcusageOutput, error) {
 }
 
 func localTimezone() string {
-	tz := strings.TrimSpace(os.Getenv("TZ"))
-	if tz != "" {
+	return localTimezoneAt(nowFunc(), strings.TrimSpace(os.Getenv("TZ")), inferLocalTimezone())
+}
+
+func localTimezoneAt(now time.Time, envTZ string, inferred string) string {
+	if tz := strings.TrimSpace(envTZ); tz != "" {
 		return tz
 	}
 
-	name := time.Now().Location().String()
-	if name == "" || name == "Local" {
-		return "UTC"
+	name := strings.TrimSpace(now.Location().String())
+	if name != "" && name != "Local" {
+		return name
 	}
-	return name
+
+	if tz := strings.TrimSpace(inferred); tz != "" {
+		return tz
+	}
+
+	// Empty means "let the downstream tool pick local timezone defaults".
+	return ""
+}
+
+func inferLocalTimezone() string {
+	if target, err := os.Readlink("/etc/localtime"); err == nil {
+		if idx := strings.Index(target, "zoneinfo/"); idx >= 0 {
+			if zone := strings.TrimSpace(target[idx+len("zoneinfo/"):]); zone != "" {
+				return zone
+			}
+		}
+	}
+
+	if raw, err := os.ReadFile("/etc/timezone"); err == nil {
+		if zone := strings.TrimSpace(string(raw)); zone != "" {
+			return zone
+		}
+	}
+	return ""
 }
 
 func sameCalendarDay(a, b time.Time) bool {

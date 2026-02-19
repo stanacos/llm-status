@@ -98,7 +98,7 @@ func TestLoadLastProviderLegacyMigrationFailureIsNonFatal(t *testing.T) {
 	}
 }
 
-func TestLoadLastProviderDoesNotFallbackWhenNewConfigExists(t *testing.T) {
+func TestLoadLastProviderFallsBackWhenNewConfigHasInvalidProvider(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	newPath, err := appConfigPath()
@@ -117,8 +117,8 @@ func TestLoadLastProviderDoesNotFallbackWhenNewConfigExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadLastProvider: %v", err)
 	}
-	if provider != "" {
-		t.Fatalf("provider=%q want empty", provider)
+	if provider != ProviderClaude {
+		t.Fatalf("provider=%q want=%q", provider, ProviderClaude)
 	}
 }
 
@@ -142,6 +142,9 @@ func TestSaveLastProviderWritesOnlyNewConfig(t *testing.T) {
 	newCfg := readTestConfig(t, newPath)
 	if newCfg.LastProvider != ProviderCodex {
 		t.Fatalf("new config provider=%q want=%q", newCfg.LastProvider, ProviderCodex)
+	}
+	if newCfg.ConfigVersion != configVersion {
+		t.Fatalf("new config version=%d want=%d", newCfg.ConfigVersion, configVersion)
 	}
 
 	legacyCfg := readTestConfig(t, legacyPath)
