@@ -194,7 +194,10 @@ type OpenCodeAuthFile struct {
 
 // OpenCodeAuthProvider holds provider-specific auth details in OpenCode auth.json.
 type OpenCodeAuthProvider struct {
-	OAuthToken string `json:"oauth_token"`
+	OAuthToken  string `json:"oauth_token"`
+	Access      string `json:"access"`
+	AccessToken string `json:"access_token"`
+	Token       string `json:"token"`
 }
 
 // CopilotTokenResponse represents the Copilot token exchange response.
