@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -777,4 +779,137 @@ func TestFetchCopilotQuotaAuthFallback(t *testing.T) {
 			t.Fatalf("unexpected warning: %v", got.Errors)
 		}
 	})
+}
+
+func TestExchangeCopilotTokenDoesNotLeakHTTPBody(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	defer func() {
+		http.DefaultTransport = originalTransport
+	}()
+
+	secretBody := `{"error":"secret-body-token-123","path":"/tmp/private/auth.json"}`
+	var calls int
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Body:       io.NopCloser(strings.NewReader(secretBody)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	_, err := exchangeCopilotToken("oauth-token")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 attempts (GET/POST), got %d", calls)
+	}
+	got := err.Error()
+	if !strings.Contains(got, "returned 401") {
+		t.Fatalf("expected status code in error, got %q", got)
+	}
+	for _, leaked := range []string{
+		"secret-body-token-123",
+		"/tmp/private/auth.json",
+		secretBody,
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("error leaked HTTP body detail %q: %q", leaked, got)
+		}
+	}
+}
+
+func TestFetchCopilotUserDoesNotLeakHTTPBody(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	defer func() {
+		http.DefaultTransport = originalTransport
+	}()
+
+	secretBody := `{"message":"Bearer leaked-token-abc","hint":"token=leaked-query-token"}`
+	var calls int
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Body:       io.NopCloser(strings.NewReader(secretBody)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	_, err := fetchCopilotUser("session-token")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 auth attempts, got %d", calls)
+	}
+	got := err.Error()
+	if !strings.Contains(got, "copilot user API returned 401") {
+		t.Fatalf("unexpected error: %q", got)
+	}
+	for _, leaked := range []string{
+		"leaked-token-abc",
+		"leaked-query-token",
+		secretBody,
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("error leaked HTTP body detail %q: %q", leaked, got)
+		}
+	}
+}
+
+func TestFetchOpenCodeDataSanitizesQuotaErrors(t *testing.T) {
+	originalQuota := fetchCopilotQuotaFunc
+	originalCcusage := fetchOpenCodeCcusageFunc
+	originalVersion := fetchOpenCodeVersionFunc
+	originalCaches := resourceCaches
+	defer func() {
+		fetchCopilotQuotaFunc = originalQuota
+		fetchOpenCodeCcusageFunc = originalCcusage
+		fetchOpenCodeVersionFunc = originalVersion
+		resourceCaches = originalCaches
+	}()
+	resetResourceCaches()
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	t.Setenv("HOME", homeDir)
+
+	quotaPath := filepath.Join(homeDir, ".local", "share", "opencode", "auth.json")
+	fetchCopilotQuotaFunc = func() (DashboardData, error) {
+		return DashboardData{
+			ProviderID: ProviderOpenCode,
+			Errors: []string{
+				"quota reset date: token=quota-secret-123 path=" + quotaPath,
+			},
+		}, nil
+	}
+	fetchOpenCodeCcusageFunc = func() (*costResult, error) {
+		return &costResult{}, nil
+	}
+	fetchOpenCodeVersionFunc = func() (string, error) {
+		return "0.9.9", nil
+	}
+
+	got := fetchOpenCodeData()
+	if len(got.Errors) == 0 {
+		t.Fatal("expected sanitized quota warning")
+	}
+	last := got.Errors[len(got.Errors)-1]
+	if !strings.Contains(last, "quota reset date:") {
+		t.Fatalf("unexpected warning: %q", last)
+	}
+	for _, leaked := range []string{"quota-secret-123", homeDir} {
+		if strings.Contains(last, leaked) {
+			t.Fatalf("quota warning leaked %q: %q", leaked, last)
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

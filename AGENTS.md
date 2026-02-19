@@ -17,6 +17,7 @@ Keep new code in root files unless a package split is clearly justified.
 - `make run`: run the app with the same ldflags metadata injection.
 - `make test`: run unit tests.
 - `make vet`: run static checks.
+- `make compliance`: run tracked-file and git-history PII/security scans.
 - `make fmt`: format all Go source files.
 - `make clean`: remove the local `./llm-status` binary.
 - `./llm-status --version` (or `./llm-status -v`): prints `llm-status <version> (commit: <commit>, built: <date>)`.
@@ -57,6 +58,15 @@ Do not commit secrets or personal usage artifacts.
 - Codex usage/status source: `~/.codex/sessions/*.jsonl`.
 - App config: `~/.llm-status/config.json`.
 - External tools invoked: `claude --version`, `codex --version`, `npx ccusage@latest`, `npx @ccusage/codex@latest`.
+
+## Compliance Checks
+- Run `make compliance` before PRs that touch credentials, auth, telemetry, docs, or CI.
+- Tracked-file scanner: `scripts/compliance-scan-tracked.sh`.
+- Git-history scanner: `scripts/compliance-scan-history.sh`.
+- Security policy: `docs/security-policy.md`.
+- Allowlist approved public IDs in `scripts/compliance/allowlist-public-ids.txt` only (never secrets/PII).
+- Rewrite/purge workflow is documented in `docs/compliance-runbook.md`.
+- UI/runtime errors must stay redacted. Use `LLM_STATUS_DEBUG_LOG=<path>` only when detailed local diagnostics are needed.
 
 ## Recent Delivered Changes (2026-02-19)
 

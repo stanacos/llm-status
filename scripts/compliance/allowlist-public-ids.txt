@@ -1,0 +1,8 @@
+# Public identifiers approved for repository/docs references.
+#
+# Add one literal token per line for simple substring allowlisting.
+# Add regex entries as: re:<pattern>
+
+stanacos/homebrew-tap
+github.com/stanacos
+stanacos@users.noreply.github.com

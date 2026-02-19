@@ -51,6 +51,28 @@ Refresh behavior:
 - Session/weekly status refreshes every 60s.
 - Cost, version, and OpenCode quota lookups are short-TTL cached to reduce repeated `npx`/network load.
 
+## Compliance
+
+Run repository compliance checks locally:
+
+```bash
+make compliance-tracked
+make compliance-history
+make compliance
+```
+
+- Tracked-file scanner: `scripts/compliance-scan-tracked.sh`
+- Git-history scanner: `scripts/compliance-scan-history.sh`
+- Public-ID allowlist: `scripts/compliance/allowlist-public-ids.txt`
+- Security policy: `docs/security-policy.md`
+- Rewrite/purge runbook: `docs/compliance-runbook.md`
+
+UI errors are intentionally redacted. For opt-in diagnostics, set `LLM_STATUS_DEBUG_LOG` to capture detailed failures (including command/network details) in a local file:
+
+```bash
+LLM_STATUS_DEBUG_LOG=.compliance/llm-status-debug.log make run
+```
+
 ## Version
 
 ```bash

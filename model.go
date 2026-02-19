@@ -52,10 +52,10 @@ func newModel() model {
 
 	provider, err := loadLastProvider()
 	if err != nil {
-		m.data.Errors = append(m.data.Errors, "config: "+err.Error())
+		appendSanitizedErrorFromErr(&m.data.Errors, "config: ", err)
 	}
 	if err := checkNpxAvailable(); err != nil {
-		m.data.Errors = append(m.data.Errors, err.Error())
+		appendSanitizedErrorFromErr(&m.data.Errors, "", err)
 	}
 	if isValidProvider(provider) {
 		m.state = StateDashboard
@@ -139,7 +139,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.secondsToRefresh = refreshInterval
 				m.data = DashboardData{ProviderID: chosen}
 				if err := saveLastProvider(chosen); err != nil {
-					m.data.Errors = append(m.data.Errors, "config: "+err.Error())
+					appendSanitizedErrorFromErr(&m.data.Errors, "config: ", err)
 				}
 				return m, fetchAllDataCmd(chosen)
 			}
@@ -214,7 +214,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			m.data.Errors = append(m.data.Errors, "warm-up: "+msg.err.Error())
+			appendSanitizedErrorFromErr(&m.data.Errors, "warm-up: ", msg.err)
 		}
 		if m.state != StateDashboard {
 			return m, nil

@@ -503,3 +503,103 @@ func TestWarmUpProviderErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestSanitizeUIErrorMessageRedactsSensitiveValues(t *testing.T) {
+	homeDir := filepath.Join(t.TempDir(), "home")
+	t.Setenv("HOME", homeDir)
+
+	raw := `copilot user API returned 401: {"authorization":"Bearer very-secret-token-123","token":"abc1234567890","path":"` +
+		filepath.Join(homeDir, ".codex", "sessions", "session.jsonl") +
+		`"}; token=query-secret-123`
+
+	got := sanitizeUIErrorMessage(raw)
+	if !strings.Contains(got, "returned 401") {
+		t.Fatalf("expected status code to remain visible, got %q", got)
+	}
+	if strings.Contains(got, "returned 401:") {
+		t.Fatalf("expected http body detail to be stripped, got %q", got)
+	}
+
+	for _, leaked := range []string{
+		"very-secret-token-123",
+		"abc1234567890",
+		"query-secret-123",
+		homeDir,
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("sanitized message leaked %q: %q", leaked, got)
+		}
+	}
+}
+
+func TestAppendSanitizedErrorFromErrRedactsAbsolutePaths(t *testing.T) {
+	homeDir := filepath.Join(t.TempDir(), "home")
+	t.Setenv("HOME", homeDir)
+
+	var errs []string
+	path := filepath.Join(homeDir, ".llm-status", "config.json")
+	appendSanitizedErrorFromErr(&errs, "config: ", fmt.Errorf("open %s: permission denied", path))
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error entry, got %d", len(errs))
+	}
+	if strings.Contains(errs[0], homeDir) {
+		t.Fatalf("expected redacted home path, got %q", errs[0])
+	}
+	if !strings.Contains(errs[0], "~/.llm-status/config.json") {
+		t.Fatalf("expected redacted home-relative path, got %q", errs[0])
+	}
+}
+
+func TestRunCommandOmitsArgsAndStderrDetails(t *testing.T) {
+	t.Setenv(debugLogEnvVar, "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	secretPath := filepath.Join(t.TempDir(), "secret-token-123")
+	_, err := runCommand(ctx, "cat", secretPath)
+	if err == nil {
+		t.Fatal("expected command error")
+	}
+
+	got := err.Error()
+	if !strings.Contains(got, "cat command failed") {
+		t.Fatalf("expected wrapped command name, got %q", got)
+	}
+	for _, leaked := range []string{
+		secretPath,
+		"secret-token-123",
+		"No such file",
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("command error leaked %q: %q", leaked, got)
+		}
+	}
+}
+
+func TestRunCommandWritesDebugLogWhenEnabled(t *testing.T) {
+	debugLogPath := filepath.Join(t.TempDir(), "debug", "llm-status.log")
+	t.Setenv(debugLogEnvVar, debugLogPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	secretPath := filepath.Join(t.TempDir(), "secret-token-xyz")
+	_, err := runCommand(ctx, "cat", secretPath)
+	if err == nil {
+		t.Fatal("expected command error")
+	}
+
+	logData, err := os.ReadFile(debugLogPath)
+	if err != nil {
+		t.Fatalf("expected debug log file, got error: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, `command failed name="cat"`) {
+		t.Fatalf("expected command debug entry, got %q", logText)
+	}
+	if !strings.Contains(logText, secretPath) {
+		t.Fatalf("expected debug log to include command detail path %q, got %q", secretPath, logText)
+	}
+}

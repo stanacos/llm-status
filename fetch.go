@@ -35,10 +35,13 @@ const (
 	copilotTimeout    = 10 * time.Second
 
 	httpErrorExcerptLimit = 512
-	costCacheTTL          = 10 * time.Minute
-	versionCacheTTL       = 30 * time.Minute
-	quotaCacheTTL         = 5 * time.Minute
-	cacheFailureRetryTTL  = 1 * time.Minute
+	debugLogEnvVar        = "LLM_STATUS_DEBUG_LOG"
+	debugLogLineLimit     = 4096
+
+	costCacheTTL         = 10 * time.Minute
+	versionCacheTTL      = 30 * time.Minute
+	quotaCacheTTL        = 5 * time.Minute
+	cacheFailureRetryTTL = 1 * time.Minute
 )
 
 var (
@@ -52,6 +55,14 @@ var (
 	fetchOpenCodeVersionFunc     = fetchOpenCodeVersion
 	openCodeVersionCommandRunner = runCommand
 	openCodeVersionPattern       = regexp.MustCompile(`(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b`)
+	uiQuotedTokenPattern         = regexp.MustCompile(`(?i)("?(?:authorization|access[_-]?token|refresh[_-]?token|oauth[_-]?token|token)"?\s*:\s*")([^"]+)(")`)
+	uiTokenAssignmentPattern     = regexp.MustCompile(`(?i)\b(authorization|access[_-]?token|refresh[_-]?token|oauth[_-]?token|token)\b\s*[:=]\s*([^\s,;]+)`)
+	uiBearerTokenPattern         = regexp.MustCompile(`(?i)\b(Bearer|token)\s+([A-Za-z0-9._~+/=-]{8,})`)
+	uiTokenQueryPattern          = regexp.MustCompile(`(?i)((?:access[_-]?token|refresh[_-]?token|oauth[_-]?token|token)=)[^&\s]+`)
+	uiJWTTokenPattern            = regexp.MustCompile(`\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b`)
+	uiHTTPStatusDetailPattern    = regexp.MustCompile(`(?i)\b(returned\s+\d{3}):\s*[^;]+`)
+	uiUnixAbsPathPattern         = regexp.MustCompile(`(^|[\s"'()\[\]{},;:])(/[^/\s"'()\[\]{},;:][^\s"'()\[\]{},;:]*)`)
+	uiWindowsAbsPathPattern      = regexp.MustCompile(`(^|[\s"'()\[\]{},;:])([A-Za-z]:\\[^\s"'()\[\]{},;:]*)`)
 	readOpenCodeAuthFunc         = readOpenCodeAuth
 	exchangeCopilotTokenFunc     = exchangeCopilotToken
 	fetchCopilotUserFunc         = fetchCopilotUser
@@ -215,6 +226,91 @@ func resetResourceCaches() {
 	resourceCaches = newProviderResourceCaches()
 }
 
+func appendSanitizedError(dst *[]string, message string) {
+	if dst == nil {
+		return
+	}
+	sanitized := sanitizeUIErrorMessage(message)
+	if sanitized == "" {
+		return
+	}
+	*dst = append(*dst, sanitized)
+}
+
+func appendSanitizedErrorFromErr(dst *[]string, prefix string, err error) {
+	if err == nil {
+		return
+	}
+	appendSanitizedError(dst, prefix+err.Error())
+}
+
+func sanitizeUIErrorMessage(message string) string {
+	sanitized := strings.TrimSpace(message)
+	if sanitized == "" {
+		return ""
+	}
+
+	// Normalize formatting before pattern-based redaction.
+	sanitized = strings.Join(strings.Fields(sanitized), " ")
+	sanitized = uiHTTPStatusDetailPattern.ReplaceAllString(sanitized, "$1")
+	sanitized = uiQuotedTokenPattern.ReplaceAllString(sanitized, `$1[REDACTED]$3`)
+	sanitized = uiTokenAssignmentPattern.ReplaceAllString(sanitized, `$1=[REDACTED]`)
+	sanitized = uiBearerTokenPattern.ReplaceAllString(sanitized, `$1 [REDACTED]`)
+	sanitized = uiTokenQueryPattern.ReplaceAllString(sanitized, `$1[REDACTED]`)
+	sanitized = uiJWTTokenPattern.ReplaceAllString(sanitized, `[REDACTED]`)
+	sanitized = redactHomePath(sanitized)
+	sanitized = uiUnixAbsPathPattern.ReplaceAllString(sanitized, `$1<path>`)
+	sanitized = uiWindowsAbsPathPattern.ReplaceAllString(sanitized, `$1<path>`)
+	return strings.TrimSpace(sanitized)
+}
+
+func redactHomePath(message string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return message
+	}
+	home = strings.TrimSpace(filepath.Clean(home))
+	if home == "" || home == "." || home == string(filepath.Separator) {
+		return message
+	}
+
+	sep := string(filepath.Separator)
+	message = strings.ReplaceAll(message, home+sep, "~"+sep)
+	message = strings.ReplaceAll(message, home, "~")
+
+	homeSlash := strings.ReplaceAll(home, `\`, `/`)
+	if homeSlash != home {
+		message = strings.ReplaceAll(message, homeSlash+"/", "~/")
+		message = strings.ReplaceAll(message, homeSlash, "~")
+	}
+	return message
+}
+
+func debugLogf(format string, args ...any) {
+	logPath := strings.TrimSpace(os.Getenv(debugLogEnvVar))
+	if logPath == "" {
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return
+	}
+
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	entry := fmt.Sprintf(format, args...)
+	entry = strings.Join(strings.Fields(entry), " ")
+	if len(entry) > debugLogLineLimit {
+		entry = entry[:debugLogLineLimit] + "..."
+	}
+
+	_, _ = fmt.Fprintf(file, "%s %s\n", time.Now().Format(time.RFC3339Nano), entry)
+}
+
 func getCachedCost(provider ProviderID, fetch func() (*costResult, error)) (*costResult, bool, error) {
 	cache, ok := resourceCaches.costByProvider[provider]
 	if !ok {
@@ -263,10 +359,12 @@ func fetchAllDataForProvider(provider ProviderID) DashboardData {
 	case ProviderOpenCode:
 		return fetchOpenCodeData()
 	default:
+		var errs []string
+		appendSanitizedError(&errs, fmt.Sprintf("unknown provider %q", provider))
 		return DashboardData{
 			ProviderID:  provider,
 			LastUpdated: time.Now(),
-			Errors:      []string{fmt.Sprintf("unknown provider %q", provider)},
+			Errors:      errs,
 		}
 	}
 }
@@ -285,7 +383,7 @@ func fetchClaudeData() DashboardData {
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "OAuth: "+err.Error())
+			appendSanitizedErrorFromErr(&data.Errors, "OAuth: ", err)
 			return
 		}
 		now := time.Now()
@@ -309,14 +407,14 @@ func fetchClaudeData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "ccusage: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "ccusage: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage: ", err)
 				return
 			}
 		}
 		if result == nil {
-			data.Errors = append(data.Errors, "ccusage: empty cached result")
+			appendSanitizedError(&data.Errors, "ccusage: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -339,9 +437,9 @@ func fetchClaudeData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "version: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: ", err)
 				return
 			}
 		}
@@ -368,7 +466,7 @@ func fetchCodexData() DashboardData {
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.Errors = append(data.Errors, "status: "+err.Error())
+			appendSanitizedErrorFromErr(&data.Errors, "status: ", err)
 			return
 		}
 		now := time.Now()
@@ -392,14 +490,14 @@ func fetchCodexData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "ccusage/codex: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage/codex: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "ccusage/codex: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage/codex: ", err)
 				return
 			}
 		}
 		if result == nil {
-			data.Errors = append(data.Errors, "ccusage/codex: empty cached result")
+			appendSanitizedError(&data.Errors, "ccusage/codex: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -422,9 +520,9 @@ func fetchCodexData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "version: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: ", err)
 				return
 			}
 		}
@@ -452,9 +550,9 @@ func fetchOpenCodeData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "quota: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "quota: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "quota: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "quota: ", err)
 				return
 			}
 		}
@@ -476,7 +574,9 @@ func fetchOpenCodeData() DashboardData {
 			data.QuotaPace = quotaData.QuotaPace
 		}
 		if len(quotaData.Errors) > 0 {
-			data.Errors = append(data.Errors, quotaData.Errors...)
+			for _, quotaErr := range quotaData.Errors {
+				appendSanitizedError(&data.Errors, quotaErr)
+			}
 		}
 	}()
 
@@ -488,14 +588,14 @@ func fetchOpenCodeData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "ccusage/opencode: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage/opencode: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "ccusage/opencode: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "ccusage/opencode: ", err)
 				return
 			}
 		}
 		if result == nil {
-			data.Errors = append(data.Errors, "ccusage/opencode: empty cached result")
+			appendSanitizedError(&data.Errors, "ccusage/opencode: empty cached result")
 			return
 		}
 		if result.hasDailyData {
@@ -518,9 +618,9 @@ func fetchOpenCodeData() DashboardData {
 		defer mu.Unlock()
 		if err != nil {
 			if stale {
-				data.Errors = append(data.Errors, "version: using cached data after refresh error: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: using cached data after refresh error: ", err)
 			} else {
-				data.Errors = append(data.Errors, "version: "+err.Error())
+				appendSanitizedErrorFromErr(&data.Errors, "version: ", err)
 				return
 			}
 		}
@@ -547,12 +647,14 @@ func readOpenCodeAuth() (string, error) {
 
 	raw, err := os.ReadFile(authPath)
 	if err != nil {
-		return "", fmt.Errorf("read opencode auth file %s: %w", authPath, err)
+		debugLogf("read opencode auth failed path=%q err=%v", authPath, err)
+		return "", fmt.Errorf("read opencode auth file: %w", err)
 	}
 
 	var authFile OpenCodeAuthFile
 	if err := json.Unmarshal(raw, &authFile); err != nil {
-		return "", fmt.Errorf("parse opencode auth file %s: %w", authPath, err)
+		debugLogf("parse opencode auth failed path=%q err=%v", authPath, err)
+		return "", fmt.Errorf("parse opencode auth file: %w", err)
 	}
 
 	oauthToken := strings.TrimSpace(authFile.GitHubCopilot.OAuthToken)
@@ -566,7 +668,8 @@ func readOpenCodeAuth() (string, error) {
 		oauthToken = strings.TrimSpace(authFile.GitHubCopilot.Token)
 	}
 	if oauthToken == "" {
-		return "", fmt.Errorf("opencode auth file %s missing github-copilot oauth token", authPath)
+		debugLogf("opencode auth missing oauth token path=%q", authPath)
+		return "", fmt.Errorf("opencode auth file missing github-copilot oauth token")
 	}
 
 	return oauthToken, nil
@@ -594,6 +697,7 @@ func exchangeCopilotToken(oauthToken string) (string, error) {
 		resp, err := client.Do(req)
 		if err != nil {
 			cancel()
+			debugLogf("copilot token request failed method=%s err=%v", method, err)
 			lastErr = fmt.Errorf("copilot token request (%s): %w", method, err)
 			continue
 		}
@@ -602,11 +706,8 @@ func exchangeCopilotToken(oauthToken string) (string, error) {
 			excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
 			resp.Body.Close()
 			cancel()
-			if excerpt != "" {
-				lastErr = fmt.Errorf("copilot token exchange (%s) returned %d: %s", method, resp.StatusCode, excerpt)
-			} else {
-				lastErr = fmt.Errorf("copilot token exchange (%s) returned %d", method, resp.StatusCode)
-			}
+			debugLogf("copilot token exchange failed method=%s status=%d body=%q", method, resp.StatusCode, excerpt)
+			lastErr = fmt.Errorf("copilot token exchange (%s) returned %d", method, resp.StatusCode)
 			continue
 		}
 
@@ -614,6 +715,7 @@ func exchangeCopilotToken(oauthToken string) (string, error) {
 		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 			resp.Body.Close()
 			cancel()
+			debugLogf("parse copilot token response failed method=%s err=%v", method, err)
 			lastErr = fmt.Errorf("parse copilot token response (%s): %w", method, err)
 			continue
 		}
@@ -622,6 +724,7 @@ func exchangeCopilotToken(oauthToken string) (string, error) {
 
 		sessionToken := strings.TrimSpace(tokenResp.Token)
 		if sessionToken == "" {
+			debugLogf("copilot token response missing token method=%s", method)
 			lastErr = fmt.Errorf("copilot token response (%s) missing token", method)
 			continue
 		}
@@ -659,6 +762,7 @@ func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
 		resp, err := client.Do(req)
 		if err != nil {
 			cancel()
+			debugLogf("copilot user request failed err=%v", err)
 			lastErr = fmt.Errorf("copilot user request: %w", err)
 			continue
 		}
@@ -667,11 +771,8 @@ func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
 			excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
 			resp.Body.Close()
 			cancel()
-			if excerpt != "" {
-				lastErr = fmt.Errorf("copilot user API returned %d: %s", resp.StatusCode, excerpt)
-			} else {
-				lastErr = fmt.Errorf("copilot user API returned %d", resp.StatusCode)
-			}
+			debugLogf("copilot user request failed status=%d body=%q", resp.StatusCode, excerpt)
+			lastErr = fmt.Errorf("copilot user API returned %d", resp.StatusCode)
 			continue
 		}
 
@@ -679,6 +780,7 @@ func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
 		if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
 			resp.Body.Close()
 			cancel()
+			debugLogf("parse copilot user response failed err=%v", err)
 			lastErr = fmt.Errorf("parse copilot user response: %w", err)
 			continue
 		}
@@ -757,7 +859,7 @@ func fetchCopilotQuota() (DashboardData, error) {
 	resetAt, resetErr := parseQuotaResetDate(userResp.QuotaResetDate, now)
 	var warnings []string
 	if resetErr != nil {
-		warnings = append(warnings, "quota reset date: "+resetErr.Error())
+		appendSanitizedErrorFromErr(&warnings, "quota reset date: ", resetErr)
 		resetAt = now
 	}
 
@@ -832,7 +934,6 @@ func readHTTPErrorExcerpt(body io.Reader, limit int64) string {
 		limit = httpErrorExcerptLimit
 	}
 
-	// Read a bounded slice for safe, compact error reporting.
 	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
 	if err != nil || len(buf) == 0 {
 		return ""
@@ -938,7 +1039,8 @@ func listCodexSessionFiles() ([]string, error) {
 func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open codex log %s: %w", path, err)
+		debugLogf("open codex log failed path=%q err=%v", path, err)
+		return nil, fmt.Errorf("open codex log: %w", err)
 	}
 	defer file.Close()
 
@@ -985,7 +1087,8 @@ func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 			break
 		}
 		if readErr != nil {
-			return nil, fmt.Errorf("read codex log %s: %w", path, readErr)
+			debugLogf("read codex log failed path=%q err=%v", path, readErr)
+			return nil, fmt.Errorf("read codex log: %w", readErr)
 		}
 	}
 	if !found {
@@ -1085,8 +1188,9 @@ func refreshOAuthToken(refreshToken string) (*OAuthTokenResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token refresh returned %d: %s", resp.StatusCode, string(body))
+		excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
+		debugLogf("token refresh failed status=%d body=%q", resp.StatusCode, excerpt)
+		return nil, fmt.Errorf("token refresh returned %d", resp.StatusCode)
 	}
 
 	var tokenResp OAuthTokenResponse
@@ -1606,10 +1710,8 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 	output, err := cmd.Output()
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
-		if detail != "" {
-			return nil, fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, detail)
-		}
-		return nil, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
+		debugLogf("command failed name=%q args=%q err=%v stderr=%q", name, args, err, detail)
+		return nil, fmt.Errorf("%s command failed: %w", name, err)
 	}
 	return output, nil
 }

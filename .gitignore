@@ -1,3 +1,6 @@
 llm-status
 dist/
 .DS_Store
+.compliance/
+compliance-debug/
+*.compliance.log
