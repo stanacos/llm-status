@@ -613,3 +613,89 @@ func writeOpenCodeAuthFixture(t *testing.T, path string, content string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+func TestFetchCopilotQuotaAuthFallback(t *testing.T) {
+	originalRead := readOpenCodeAuthFunc
+	originalExchange := exchangeCopilotTokenFunc
+	originalUser := fetchCopilotUserFunc
+	defer func() {
+		readOpenCodeAuthFunc = originalRead
+		exchangeCopilotTokenFunc = originalExchange
+		fetchCopilotUserFunc = originalUser
+	}()
+
+	t.Run("uses direct token when user endpoint accepts it", func(t *testing.T) {
+		readOpenCodeAuthFunc = func() (string, error) { return "direct-token", nil }
+		exchangeCalled := false
+		exchangeCopilotTokenFunc = func(_ string) (string, error) {
+			exchangeCalled = true
+			return "", errors.New("should not be called")
+		}
+		fetchCopilotUserFunc = func(token string) (*CopilotUserResponse, error) {
+			if token != "direct-token" {
+				t.Fatalf("unexpected token: %q", token)
+			}
+			resp := &CopilotUserResponse{}
+			resp.QuotaSnapshots.PremiumInteractions.Remaining = 80
+			resp.QuotaSnapshots.PremiumInteractions.Entitlement = 100
+			resp.QuotaResetDate = "2026-02-28"
+			return resp, nil
+		}
+
+		got, err := fetchCopilotQuota()
+		if err != nil {
+			t.Fatalf("fetchCopilotQuota() unexpected error: %v", err)
+		}
+		if exchangeCalled {
+			t.Fatal("expected exchange not to be called")
+		}
+		if !got.HasSessionData || !got.HasWeeklyData {
+			t.Fatalf("expected session/weekly data, got %+v", got)
+		}
+		if got.QuotaUsed != 20 || got.QuotaEntitlement != 100 {
+			t.Fatalf("unexpected quota totals: %+v", got)
+		}
+	})
+
+	t.Run("falls back to exchange when direct token fails", func(t *testing.T) {
+		readOpenCodeAuthFunc = func() (string, error) { return "oauth-token", nil }
+		exchangeCopilotTokenFunc = func(token string) (string, error) {
+			if token != "oauth-token" {
+				t.Fatalf("unexpected exchange token: %q", token)
+			}
+			return "session-token", nil
+		}
+		call := 0
+		fetchCopilotUserFunc = func(token string) (*CopilotUserResponse, error) {
+			call++
+			if call == 1 {
+				if token != "oauth-token" {
+					t.Fatalf("unexpected first token: %q", token)
+				}
+				return nil, errors.New("unauthorized")
+			}
+			if call == 2 {
+				if token != "session-token" {
+					t.Fatalf("unexpected second token: %q", token)
+				}
+				resp := &CopilotUserResponse{}
+				resp.QuotaSnapshots.PremiumInteractions.Remaining = 150
+				resp.QuotaSnapshots.PremiumInteractions.Entitlement = 300
+				resp.QuotaResetDate = "2026-03-01"
+				return resp, nil
+			}
+			return nil, errors.New("too many calls")
+		}
+
+		got, err := fetchCopilotQuota()
+		if err != nil {
+			t.Fatalf("fetchCopilotQuota() unexpected error: %v", err)
+		}
+		if call != 2 {
+			t.Fatalf("expected 2 fetchCopilotUser calls, got %d", call)
+		}
+		if got.QuotaUsed != 150 || got.QuotaEntitlement != 300 {
+			t.Fatalf("unexpected quota totals: %+v", got)
+		}
+	})
+}

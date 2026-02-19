@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2
+- Fixed OpenCode Copilot quota auth flow to try direct auth token usage before token exchange.
+- Added Copilot token exchange fallbacks across HTTP methods and user auth header formats to handle endpoint variations.
+- Added regression tests for direct-token quota success and token-exchange fallback behavior.
+
 ## v0.2.1
 - Fixed OpenCode auth token discovery to support additional auth.json token keys (including `access`).
 - Fixed OpenCode cost parsing when `npx` emits non-JSON wrapper lines before JSON output.
