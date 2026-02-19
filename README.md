@@ -41,6 +41,7 @@ Keybindings:
 - `q`: quit
 - `r`: refresh now
 - `p`: open provider chooser
+- `w`: warm up current provider and refresh
 
 Provider chooser controls: `↑/↓` (or `j/k`) and `Enter`.
 
