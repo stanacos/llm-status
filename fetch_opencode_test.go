@@ -532,11 +532,14 @@ func TestFetchOpenCodeDataMergesAllSources(t *testing.T) {
 	originalQuota := fetchCopilotQuotaFunc
 	originalCcusage := fetchOpenCodeCcusageFunc
 	originalVersion := fetchOpenCodeVersionFunc
+	originalCaches := resourceCaches
 	defer func() {
 		fetchCopilotQuotaFunc = originalQuota
 		fetchOpenCodeCcusageFunc = originalCcusage
 		fetchOpenCodeVersionFunc = originalVersion
+		resourceCaches = originalCaches
 	}()
+	resetResourceCaches()
 
 	sessionReset := time.Date(2026, time.February, 21, 9, 0, 0, 0, time.UTC)
 	weeklyReset := time.Date(2026, time.February, 28, 9, 0, 0, 0, time.UTC)
@@ -618,11 +621,16 @@ func TestFetchCopilotQuotaAuthFallback(t *testing.T) {
 	originalRead := readOpenCodeAuthFunc
 	originalExchange := exchangeCopilotTokenFunc
 	originalUser := fetchCopilotUserFunc
+	originalNow := nowFunc
 	defer func() {
 		readOpenCodeAuthFunc = originalRead
 		exchangeCopilotTokenFunc = originalExchange
 		fetchCopilotUserFunc = originalUser
+		nowFunc = originalNow
 	}()
+	nowFunc = func() time.Time {
+		return time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	}
 
 	t.Run("uses direct token when user endpoint accepts it", func(t *testing.T) {
 		readOpenCodeAuthFunc = func() (string, error) { return "direct-token", nil }
@@ -696,6 +704,77 @@ func TestFetchCopilotQuotaAuthFallback(t *testing.T) {
 		}
 		if got.QuotaUsed != 150 || got.QuotaEntitlement != 300 {
 			t.Fatalf("unexpected quota totals: %+v", got)
+		}
+	})
+
+	t.Run("accepts RFC3339 quota reset date", func(t *testing.T) {
+		nowFunc = func() time.Time {
+			return time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+		}
+		readOpenCodeAuthFunc = func() (string, error) { return "direct-token", nil }
+		exchangeCopilotTokenFunc = func(_ string) (string, error) {
+			return "", errors.New("should not be called")
+		}
+		fetchCopilotUserFunc = func(token string) (*CopilotUserResponse, error) {
+			if token != "direct-token" {
+				t.Fatalf("unexpected token: %q", token)
+			}
+			resp := &CopilotUserResponse{}
+			resp.QuotaSnapshots.PremiumInteractions.Remaining = 70
+			resp.QuotaSnapshots.PremiumInteractions.Entitlement = 100
+			resp.QuotaResetDate = "2026-02-28T00:00:00Z"
+			return resp, nil
+		}
+
+		got, err := fetchCopilotQuota()
+		if err != nil {
+			t.Fatalf("fetchCopilotQuota() unexpected error: %v", err)
+		}
+		if !got.HasSessionData || !got.HasWeeklyData {
+			t.Fatalf("expected session/weekly data, got %+v", got)
+		}
+		wantReset := time.Date(2026, time.February, 28, 0, 0, 0, 0, time.UTC).In(time.Local)
+		if !got.SessionResets.Equal(wantReset) {
+			t.Fatalf("unexpected reset date: got %v want %v", got.SessionResets, wantReset)
+		}
+		if len(got.Errors) != 0 {
+			t.Fatalf("expected no warnings, got %v", got.Errors)
+		}
+	})
+
+	t.Run("keeps quota data when reset date parsing fails", func(t *testing.T) {
+		fixedNow := time.Date(2026, time.February, 19, 12, 30, 0, 0, time.UTC)
+		nowFunc = func() time.Time { return fixedNow }
+		readOpenCodeAuthFunc = func() (string, error) { return "direct-token", nil }
+		exchangeCopilotTokenFunc = func(_ string) (string, error) {
+			return "", errors.New("should not be called")
+		}
+		fetchCopilotUserFunc = func(token string) (*CopilotUserResponse, error) {
+			if token != "direct-token" {
+				t.Fatalf("unexpected token: %q", token)
+			}
+			resp := &CopilotUserResponse{}
+			resp.QuotaSnapshots.PremiumInteractions.Remaining = 50
+			resp.QuotaSnapshots.PremiumInteractions.Entitlement = 100
+			resp.QuotaResetDate = "2026/02/28"
+			return resp, nil
+		}
+
+		got, err := fetchCopilotQuota()
+		if err != nil {
+			t.Fatalf("fetchCopilotQuota() unexpected error: %v", err)
+		}
+		if got.QuotaUsed != 50 || got.QuotaEntitlement != 100 {
+			t.Fatalf("unexpected quota totals: %+v", got)
+		}
+		if !got.SessionResets.Equal(fixedNow) {
+			t.Fatalf("expected fallback reset time %v, got %v", fixedNow, got.SessionResets)
+		}
+		if len(got.Errors) == 0 {
+			t.Fatal("expected warning for invalid reset date")
+		}
+		if !strings.Contains(got.Errors[len(got.Errors)-1], "quota reset date:") {
+			t.Fatalf("unexpected warning: %v", got.Errors)
 		}
 	})
 }

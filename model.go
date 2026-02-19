@@ -29,6 +29,7 @@ type model struct {
 	spinner          spinner.Model
 	fetching         bool
 	warmingUp        bool
+	queuedRefresh    bool
 	width            int
 	height           int
 	secondsToRefresh int
@@ -134,6 +135,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = StateDashboard
 				m.selectedProvider = chosen
 				m.fetching = true
+				m.queuedRefresh = false
 				m.secondsToRefresh = refreshInterval
 				m.data = DashboardData{ProviderID: chosen}
 				if err := saveLastProvider(chosen); err != nil {
@@ -146,6 +148,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "r":
+			if m.fetching {
+				m.queuedRefresh = true
+				m.secondsToRefresh = refreshInterval
+				return m, nil
+			}
 			m.fetching = true
 			m.secondsToRefresh = refreshInterval
 			return m, fetchAllDataCmd(m.selectedProvider)
@@ -158,6 +165,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			m.state = StateChooseProvider
 			m.fetching = false
+			m.queuedRefresh = false
 			m.providerMenuIdx = providerIndex(m.selectedProvider)
 			return m, nil
 		}
@@ -169,6 +177,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.state != StateDashboard {
+			return m, doTick()
+		}
+		if m.fetching {
 			return m, doTick()
 		}
 
@@ -188,6 +199,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.data = DashboardData{ProviderID: msg.provider}
 		}
 		m.data = mergeData(m.data, msg.data)
+		if m.queuedRefresh {
+			m.queuedRefresh = false
+			m.fetching = true
+			m.secondsToRefresh = refreshInterval
+			return m, fetchAllDataCmd(m.selectedProvider)
+		}
 		m.fetching = false
 		return m, nil
 
@@ -200,6 +217,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.data.Errors = append(m.data.Errors, "warm-up: "+msg.err.Error())
 		}
 		if m.state != StateDashboard {
+			return m, nil
+		}
+		if m.fetching {
+			m.queuedRefresh = true
+			m.secondsToRefresh = refreshInterval
 			return m, nil
 		}
 		m.fetching = true
@@ -504,6 +526,8 @@ func (m model) renderMonthlyPanel() string {
 
 // mergeData merges new data into old, retaining previous values for failed sources.
 func mergeData(old, new DashboardData) DashboardData {
+	const maxErrorEntries = 12
+
 	result := old
 	result.ProviderID = new.ProviderID
 
@@ -545,6 +569,14 @@ func mergeData(old, new DashboardData) DashboardData {
 	}
 
 	result.LastUpdated = new.LastUpdated
-	result.Errors = new.Errors
+	if len(old.Errors) > 0 || len(new.Errors) > 0 {
+		mergedErrors := make([]string, 0, len(old.Errors)+len(new.Errors))
+		mergedErrors = append(mergedErrors, old.Errors...)
+		mergedErrors = append(mergedErrors, new.Errors...)
+		if len(mergedErrors) > maxErrorEntries {
+			mergedErrors = mergedErrors[len(mergedErrors)-maxErrorEntries:]
+		}
+		result.Errors = mergedErrors
+	}
 	return result
 }

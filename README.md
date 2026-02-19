@@ -47,6 +47,10 @@ Keybindings:
 
 Provider chooser controls: `↑/↓` (or `j/k`) and `Enter`.
 
+Refresh behavior:
+- Session/weekly status refreshes every 60s.
+- Cost, version, and OpenCode quota lookups are short-TTL cached to reduce repeated `npx`/network load.
+
 ## Version
 
 ```bash
