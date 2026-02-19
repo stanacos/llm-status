@@ -223,9 +223,12 @@ func TestWarmUpProviderDispatch(t *testing.T) {
 	if err := warmUpProvider(ProviderCodex); err != nil {
 		t.Fatalf("warmUpProvider(ProviderCodex) error: %v", err)
 	}
+	if err := warmUpProvider(ProviderOpenCode); err != nil {
+		t.Fatalf("warmUpProvider(ProviderOpenCode) error: %v", err)
+	}
 
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 warm-up calls, got %d", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 warm-up calls, got %d", len(calls))
 	}
 	if calls[0].name != "claude" {
 		t.Fatalf("expected first command claude, got %q", calls[0].name)
@@ -242,6 +245,12 @@ func TestWarmUpProviderDispatch(t *testing.T) {
 			calls[1].args,
 			[]string{"exec", "--skip-git-repo-check", codexWarmUpPrompt},
 		)
+	}
+	if calls[2].name != "opencode" {
+		t.Fatalf("expected third command opencode, got %q", calls[2].name)
+	}
+	if got, want := strings.Join(calls[2].args, "\x00"), strings.Join([]string{"version"}, "\x00"); got != want {
+		t.Fatalf("unexpected opencode args: got %q want %q", calls[2].args, []string{"version"})
 	}
 }
 
