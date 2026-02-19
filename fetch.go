@@ -24,9 +24,15 @@ const (
 	oauthTokenURL     = "https://console.anthropic.com/v1/oauth/token"
 	oauthClientID     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	tokenExpiryBuffer = 5 * time.Minute
+	sessionWindow     = 5 * time.Hour
+	weeklyWindow      = 7 * 24 * time.Hour
+	resetPastGrace    = 2 * time.Minute
 )
 
-var errNoTokenCount = errors.New("no token_count event found")
+var (
+	errNoTokenCount      = errors.New("no token_count event found")
+	errTokenCountPending = errors.New("token_count event found but rate limits are not initialized")
+)
 
 // costResult holds parsed results from a single cost command call.
 type costResult struct {
@@ -123,12 +129,17 @@ func fetchClaudeData() DashboardData {
 			data.Errors = append(data.Errors, "OAuth: "+err.Error())
 			return
 		}
-		data.SessionUtil = usage.FiveHour.Utilization
-		data.SessionResets = usage.FiveHour.ResetsAt
-		data.HasSessionData = true
-		data.WeeklyUtil = usage.SevenDay.Utilization
-		data.WeeklyResets = usage.SevenDay.ResetsAt
-		data.HasWeeklyData = true
+		now := time.Now()
+		if isPlausibleResetTime(now, usage.FiveHour.ResetsAt, sessionWindow) {
+			data.SessionUtil = usage.FiveHour.Utilization
+			data.SessionResets = usage.FiveHour.ResetsAt
+			data.HasSessionData = true
+		}
+		if isPlausibleResetTime(now, usage.SevenDay.ResetsAt, weeklyWindow) {
+			data.WeeklyUtil = usage.SevenDay.Utilization
+			data.WeeklyResets = usage.SevenDay.ResetsAt
+			data.HasWeeklyData = true
+		}
 	}()
 
 	// ccusage cost + tokens (30-day window, extract today from daily array)
@@ -189,12 +200,13 @@ func fetchCodexData() DashboardData {
 			data.Errors = append(data.Errors, "status: "+err.Error())
 			return
 		}
-		if status.hasSession {
+		now := time.Now()
+		if status.hasSession && isPlausibleResetTime(now, status.sessionEnds, sessionWindow) {
 			data.SessionUtil = status.sessionUtil
 			data.SessionResets = status.sessionEnds
 			data.HasSessionData = true
 		}
-		if status.hasWeekly {
+		if status.hasWeekly && isPlausibleResetTime(now, status.weeklyEnds, weeklyWindow) {
 			data.WeeklyUtil = status.weeklyUtil
 			data.WeeklyResets = status.weeklyEnds
 			data.HasWeeklyData = true
@@ -247,12 +259,32 @@ func fetchCodexStatusFromLogs() (*codexStatusSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	return selectCodexStatusFromFiles(files)
+}
+
+func selectCodexStatusFromFiles(files []string) (*codexStatusSnapshot, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no codex session files found")
+	}
+
+	ordered := append([]string(nil), files...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i] > ordered[j]
+	})
 
 	var lastErr error
-	for _, filePath := range files {
+	for i, filePath := range ordered {
 		status, err := parseLatestTokenCountFromFile(filePath)
 		if err == nil {
 			return status, nil
+		}
+		if errors.Is(err, errTokenCountPending) {
+			// The newest session has not emitted usable rate limits yet.
+			// Avoid falling back to stale status from older sessions.
+			if i == 0 {
+				return &codexStatusSnapshot{}, nil
+			}
+			continue
 		}
 		if errors.Is(err, errNoTokenCount) {
 			continue
@@ -316,6 +348,7 @@ func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 
 	var latest codexStatusSnapshot
 	found := false
+	sawTokenCount := false
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -335,6 +368,7 @@ func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 		if evtType.Type != "token_count" {
 			continue
 		}
+		sawTokenCount = true
 
 		var payload codexTokenCountPayload
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
@@ -366,6 +400,9 @@ func parseLatestTokenCountFromFile(path string) (*codexStatusSnapshot, error) {
 		return nil, fmt.Errorf("scan codex log %s: %w", path, err)
 	}
 	if !found {
+		if sawTokenCount {
+			return nil, errTokenCountPending
+		}
 		return nil, errNoTokenCount
 	}
 	return &latest, nil
@@ -391,21 +428,48 @@ func applyCodexRateLimits(snapshot *codexStatusSnapshot, limits codexRateLimits)
 }
 
 func setSessionLimit(snapshot *codexStatusSnapshot, limit codexRateLimit) {
-	if limit.ResetsAt <= 0 {
+	resetAt, ok := parseResetTimestamp(limit.ResetsAt)
+	if !ok || !isPlausibleResetTime(time.Now(), resetAt, sessionWindow) {
 		return
 	}
 	snapshot.sessionUtil = limit.UsedPercent
-	snapshot.sessionEnds = time.Unix(limit.ResetsAt, 0)
+	snapshot.sessionEnds = resetAt
 	snapshot.hasSession = true
 }
 
 func setWeeklyLimit(snapshot *codexStatusSnapshot, limit codexRateLimit) {
-	if limit.ResetsAt <= 0 {
+	resetAt, ok := parseResetTimestamp(limit.ResetsAt)
+	if !ok || !isPlausibleResetTime(time.Now(), resetAt, weeklyWindow) {
 		return
 	}
 	snapshot.weeklyUtil = limit.UsedPercent
-	snapshot.weeklyEnds = time.Unix(limit.ResetsAt, 0)
+	snapshot.weeklyEnds = resetAt
 	snapshot.hasWeekly = true
+}
+
+func parseResetTimestamp(raw int64) (time.Time, bool) {
+	if raw <= 0 {
+		return time.Time{}, false
+	}
+	// Guard against schema shifts between Unix seconds and Unix milliseconds.
+	if raw >= 1_000_000_000_000 {
+		return time.UnixMilli(raw), true
+	}
+	return time.Unix(raw, 0), true
+}
+
+func isPlausibleResetTime(now time.Time, resetAt time.Time, window time.Duration) bool {
+	if resetAt.IsZero() {
+		return false
+	}
+	if resetAt.Before(now.Add(-resetPastGrace)) {
+		return false
+	}
+	maxFuture := window*2 + resetPastGrace
+	if resetAt.After(now.Add(maxFuture)) {
+		return false
+	}
+	return true
 }
 
 // refreshOAuthToken exchanges a refresh token for a new access token.
