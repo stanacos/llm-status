@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -197,4 +198,68 @@ func validTokenCountLine(ts string, sessionReset int64, weeklyReset int64, sessi
 		weeklyUtil,
 		weeklyReset,
 	)
+}
+
+func TestWarmUpProviderDispatch(t *testing.T) {
+	originalRunner := warmUpCommandRunner
+	defer func() {
+		warmUpCommandRunner = originalRunner
+	}()
+
+	var commandNames []string
+	warmUpCommandRunner = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		commandNames = append(commandNames, name)
+		return []byte("ok"), nil
+	}
+
+	if err := warmUpProvider(ProviderClaude); err != nil {
+		t.Fatalf("warmUpProvider(ProviderClaude) error: %v", err)
+	}
+	if err := warmUpProvider(ProviderCodex); err != nil {
+		t.Fatalf("warmUpProvider(ProviderCodex) error: %v", err)
+	}
+
+	if len(commandNames) != 2 {
+		t.Fatalf("expected 2 warm-up calls, got %d", len(commandNames))
+	}
+	if commandNames[0] != "claude" {
+		t.Fatalf("expected first command claude, got %q", commandNames[0])
+	}
+	if commandNames[1] != "codex" {
+		t.Fatalf("expected second command codex, got %q", commandNames[1])
+	}
+}
+
+func TestWarmUpProviderErrors(t *testing.T) {
+	t.Run("unknown provider", func(t *testing.T) {
+		err := warmUpProvider(ProviderID("unknown"))
+		if err == nil {
+			t.Fatal("expected error for unknown provider")
+		}
+		if !strings.Contains(err.Error(), `unknown provider "unknown"`) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("codex command failure is wrapped", func(t *testing.T) {
+		originalRunner := warmUpCommandRunner
+		defer func() {
+			warmUpCommandRunner = originalRunner
+		}()
+
+		warmUpCommandRunner = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			if name == "codex" {
+				return nil, errors.New("boom")
+			}
+			return []byte("ok"), nil
+		}
+
+		err := warmUpProvider(ProviderCodex)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "codex warm-up failed") {
+			t.Fatalf("expected wrapped codex error, got %v", err)
+		}
+	})
 }

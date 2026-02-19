@@ -15,6 +15,11 @@ const (
 	minHeight       = 20
 )
 
+var (
+	fetchAllDataForProviderFunc = fetchAllDataForProvider
+	warmUpProviderFunc          = warmUpProvider
+)
+
 type model struct {
 	state            AppState
 	selectedProvider ProviderID
@@ -23,6 +28,7 @@ type model struct {
 	data             DashboardData
 	spinner          spinner.Model
 	fetching         bool
+	warmingUp        bool
 	width            int
 	height           int
 	secondsToRefresh int
@@ -77,8 +83,15 @@ func doTick() tea.Cmd {
 
 func fetchAllDataCmd(provider ProviderID) tea.Cmd {
 	return func() tea.Msg {
-		data := fetchAllDataForProvider(provider)
+		data := fetchAllDataForProviderFunc(provider)
 		return dataFetchedMsg{provider: provider, data: data}
+	}
+}
+
+func warmupProviderCmd(provider ProviderID) tea.Cmd {
+	return func() tea.Msg {
+		err := warmUpProviderFunc(provider)
+		return warmupFinishedMsg{provider: provider, err: err}
 	}
 }
 
@@ -136,6 +149,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fetching = true
 			m.secondsToRefresh = refreshInterval
 			return m, fetchAllDataCmd(m.selectedProvider)
+		case "w":
+			if m.warmingUp {
+				return m, nil
+			}
+			m.warmingUp = true
+			return m, warmupProviderCmd(m.selectedProvider)
 		case "p":
 			m.state = StateChooseProvider
 			m.fetching = false
@@ -171,6 +190,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.data = mergeData(m.data, msg.data)
 		m.fetching = false
 		return m, nil
+
+	case warmupFinishedMsg:
+		m.warmingUp = false
+		if msg.provider != m.selectedProvider {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.data.Errors = append(m.data.Errors, "warm-up: "+msg.err.Error())
+		}
+		if m.state != StateDashboard {
+			return m, nil
+		}
+		m.fetching = true
+		m.secondsToRefresh = refreshInterval
+		return m, fetchAllDataCmd(m.selectedProvider)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -338,7 +372,7 @@ func (m model) renderDashboardView() string {
 		Foreground(colorComment).
 		Width(cw).
 		Align(lipgloss.Center).
-		Render("q: quit • p: providers • r: refresh • Next: " + formatCountdown(m.secondsToRefresh))
+		Render("q: quit • p: providers • r: refresh • w: warm up")
 
 	parts := []string{header}
 	if versionLine != "" {
@@ -436,13 +470,6 @@ func (m model) renderMonthlyPanel() string {
 		renderMetricRow("Tokens", tokenStr, cw-4),
 	)
 	return renderPanel("Last 30 Days", content, cw)
-}
-
-func formatCountdown(seconds int) string {
-	if seconds <= 0 {
-		return "now"
-	}
-	return formatInt(seconds) + "s"
 }
 
 // mergeData merges new data into old, retaining previous values for failed sources.

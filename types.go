@@ -211,3 +211,8 @@ type dataFetchedMsg struct {
 	provider ProviderID
 	data     DashboardData
 }
+
+type warmupFinishedMsg struct {
+	provider ProviderID
+	err      error
+}
