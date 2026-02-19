@@ -27,11 +27,18 @@ const (
 	sessionWindow     = 5 * time.Hour
 	weeklyWindow      = 7 * 24 * time.Hour
 	resetPastGrace    = 2 * time.Minute
+	warmUpTimeout     = 45 * time.Second
 )
 
 var (
 	errNoTokenCount      = errors.New("no token_count event found")
 	errTokenCountPending = errors.New("token_count event found but rate limits are not initialized")
+	warmUpCommandRunner  = runCommand
+)
+
+const (
+	claudeWarmUpPrompt = "Reply with exactly: ok. Do not use any tools."
+	codexWarmUpPrompt  = "Reply with exactly: ok. Do not run any tools."
 )
 
 // costResult holds parsed results from a single cost command call.
@@ -826,6 +833,37 @@ func fetchCodexVersion() (string, error) {
 		return fields[1], nil
 	}
 	return raw, nil
+}
+
+func warmUpProvider(provider ProviderID) error {
+	switch provider {
+	case ProviderClaude:
+		return warmUpClaude()
+	case ProviderCodex:
+		return warmUpCodex()
+	default:
+		return fmt.Errorf("unknown provider %q", provider)
+	}
+}
+
+func warmUpClaude() error {
+	ctx, cancel := context.WithTimeout(context.Background(), warmUpTimeout)
+	defer cancel()
+
+	if _, err := warmUpCommandRunner(ctx, "claude", "-p", claudeWarmUpPrompt); err != nil {
+		return fmt.Errorf("claude warm-up failed: %w", err)
+	}
+	return nil
+}
+
+func warmUpCodex() error {
+	ctx, cancel := context.WithTimeout(context.Background(), warmUpTimeout)
+	defer cancel()
+
+	if _, err := warmUpCommandRunner(ctx, "codex", "exec", codexWarmUpPrompt); err != nil {
+		return fmt.Errorf("codex warm-up failed: %w", err)
+	}
+	return nil
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
