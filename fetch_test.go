@@ -206,9 +206,14 @@ func TestWarmUpProviderDispatch(t *testing.T) {
 		warmUpCommandRunner = originalRunner
 	}()
 
-	var commandNames []string
-	warmUpCommandRunner = func(_ context.Context, name string, _ ...string) ([]byte, error) {
-		commandNames = append(commandNames, name)
+	type commandCall struct {
+		name string
+		args []string
+	}
+
+	var calls []commandCall
+	warmUpCommandRunner = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, commandCall{name: name, args: append([]string(nil), args...)})
 		return []byte("ok"), nil
 	}
 
@@ -219,14 +224,24 @@ func TestWarmUpProviderDispatch(t *testing.T) {
 		t.Fatalf("warmUpProvider(ProviderCodex) error: %v", err)
 	}
 
-	if len(commandNames) != 2 {
-		t.Fatalf("expected 2 warm-up calls, got %d", len(commandNames))
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 warm-up calls, got %d", len(calls))
 	}
-	if commandNames[0] != "claude" {
-		t.Fatalf("expected first command claude, got %q", commandNames[0])
+	if calls[0].name != "claude" {
+		t.Fatalf("expected first command claude, got %q", calls[0].name)
 	}
-	if commandNames[1] != "codex" {
-		t.Fatalf("expected second command codex, got %q", commandNames[1])
+	if got, want := strings.Join(calls[0].args, "\x00"), strings.Join([]string{"-p", claudeWarmUpPrompt}, "\x00"); got != want {
+		t.Fatalf("unexpected claude args: got %q want %q", calls[0].args, []string{"-p", claudeWarmUpPrompt})
+	}
+	if calls[1].name != "codex" {
+		t.Fatalf("expected second command codex, got %q", calls[1].name)
+	}
+	if got, want := strings.Join(calls[1].args, "\x00"), strings.Join([]string{"exec", "--skip-git-repo-check", codexWarmUpPrompt}, "\x00"); got != want {
+		t.Fatalf(
+			"unexpected codex args: got %q want %q",
+			calls[1].args,
+			[]string{"exec", "--skip-git-repo-check", codexWarmUpPrompt},
+		)
 	}
 }
 

@@ -860,7 +860,7 @@ func warmUpCodex() error {
 	ctx, cancel := context.WithTimeout(context.Background(), warmUpTimeout)
 	defer cancel()
 
-	if _, err := warmUpCommandRunner(ctx, "codex", "exec", codexWarmUpPrompt); err != nil {
+	if _, err := warmUpCommandRunner(ctx, "codex", "exec", "--skip-git-repo-check", codexWarmUpPrompt); err != nil {
 		return fmt.Errorf("codex warm-up failed: %w", err)
 	}
 	return nil
