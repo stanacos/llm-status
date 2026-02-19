@@ -249,8 +249,8 @@ func TestWarmUpProviderDispatch(t *testing.T) {
 	if calls[2].name != "opencode" {
 		t.Fatalf("expected third command opencode, got %q", calls[2].name)
 	}
-	if got, want := strings.Join(calls[2].args, "\x00"), strings.Join([]string{"version"}, "\x00"); got != want {
-		t.Fatalf("unexpected opencode args: got %q want %q", calls[2].args, []string{"version"})
+	if got, want := strings.Join(calls[2].args, "\x00"), strings.Join([]string{"--version"}, "\x00"); got != want {
+		t.Fatalf("unexpected opencode args: got %q want %q", calls[2].args, []string{"--version"})
 	}
 }
 

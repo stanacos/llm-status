@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ var (
 	fetchOpenCodeCcusageFunc     = fetchOpenCodeCcusage
 	fetchOpenCodeVersionFunc     = fetchOpenCodeVersion
 	openCodeVersionCommandRunner = runCommand
+	openCodeVersionPattern       = regexp.MustCompile(`(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b`)
 )
 
 const (
@@ -374,6 +376,15 @@ func readOpenCodeAuth() (string, error) {
 	}
 
 	oauthToken := strings.TrimSpace(authFile.GitHubCopilot.OAuthToken)
+	if oauthToken == "" {
+		oauthToken = strings.TrimSpace(authFile.GitHubCopilot.AccessToken)
+	}
+	if oauthToken == "" {
+		oauthToken = strings.TrimSpace(authFile.GitHubCopilot.Access)
+	}
+	if oauthToken == "" {
+		oauthToken = strings.TrimSpace(authFile.GitHubCopilot.Token)
+	}
 	if oauthToken == "" {
 		return "", fmt.Errorf("opencode auth file %s missing github-copilot oauth token", authPath)
 	}
@@ -1118,6 +1129,7 @@ func fetchOpenCodeCcusage() (*costResult, error) {
 	output, err := runCommand(
 		ctx,
 		"npx",
+		"--yes",
 		"@ccusage/opencode@latest",
 		"daily",
 		"--json",
@@ -1128,8 +1140,8 @@ func fetchOpenCodeCcusage() (*costResult, error) {
 		return nil, fmt.Errorf("run @ccusage/opencode: %w", err)
 	}
 
-	var parsed CcusageOutput
-	if err := json.Unmarshal(output, &parsed); err != nil {
+	parsed, err := parseCcusageOutput(output)
+	if err != nil {
 		return nil, fmt.Errorf("parse @ccusage/opencode output: %w", err)
 	}
 
@@ -1150,6 +1162,27 @@ func fetchOpenCodeCcusage() (*costResult, error) {
 	}
 
 	return result, nil
+}
+
+// parseCcusageOutput tolerates wrapper lines around JSON (for example npx notices),
+// and extracts the first JSON object payload when needed.
+func parseCcusageOutput(output []byte) (*CcusageOutput, error) {
+	var parsed CcusageOutput
+	if err := json.Unmarshal(output, &parsed); err == nil {
+		return &parsed, nil
+	}
+
+	start := bytes.IndexByte(output, '{')
+	end := bytes.LastIndexByte(output, '}')
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON object found in output")
+	}
+
+	slice := bytes.TrimSpace(output[start : end+1])
+	if err := json.Unmarshal(slice, &parsed); err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func localTimezone() string {
@@ -1213,19 +1246,38 @@ func fetchOpenCodeVersion() (string, error) {
 	defer cancel()
 
 	output, err := openCodeVersionCommandRunner(ctx, "opencode", "version")
-	if err != nil {
-		return "", fmt.Errorf("run opencode version: %w", err)
+	if err == nil {
+		if parsed := parseOpenCodeVersionString(string(output)); parsed != "" {
+			return parsed, nil
+		}
 	}
 
-	raw := strings.TrimSpace(string(output))
-	fields := strings.Fields(raw)
-	if len(fields) == 0 {
-		return raw, nil
+	fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fallbackCancel()
+	fallbackOutput, fallbackErr := openCodeVersionCommandRunner(fallbackCtx, "opencode", "--version")
+	if fallbackErr != nil {
+		if err != nil {
+			return "", fmt.Errorf("run opencode version: %v; run opencode --version: %w", err, fallbackErr)
+		}
+		return "", fmt.Errorf("run opencode --version: %w", fallbackErr)
 	}
-	if len(fields) >= 2 && strings.EqualFold(fields[0], "opencode") {
-		return fields[1], nil
+	if parsed := parseOpenCodeVersionString(string(fallbackOutput)); parsed != "" {
+		return parsed, nil
 	}
-	return fields[0], nil
+
+	return "", fmt.Errorf("unable to parse opencode version output")
+}
+
+func parseOpenCodeVersionString(raw string) string {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "" {
+		return ""
+	}
+	match := openCodeVersionPattern.FindStringSubmatch(normalized)
+	if len(match) != 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func warmUpProvider(provider ProviderID) error {
@@ -1265,7 +1317,7 @@ func warmUpOpenCode() error {
 	ctx, cancel := context.WithTimeout(context.Background(), warmUpTimeout)
 	defer cancel()
 
-	if _, err := warmUpCommandRunner(ctx, "opencode", "version"); err != nil {
+	if _, err := warmUpCommandRunner(ctx, "opencode", "--version"); err != nil {
 		return fmt.Errorf("opencode warm-up failed: %w", err)
 	}
 	return nil
