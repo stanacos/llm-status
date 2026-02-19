@@ -6,7 +6,7 @@
 
 ### Homebrew
 ```bash
-brew tap stanacos/tap
+brew tap stanacos/homebrew-tap
 brew install llm-status
 ```
 
