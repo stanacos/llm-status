@@ -47,6 +47,9 @@ var (
 	fetchOpenCodeVersionFunc     = fetchOpenCodeVersion
 	openCodeVersionCommandRunner = runCommand
 	openCodeVersionPattern       = regexp.MustCompile(`(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b`)
+	readOpenCodeAuthFunc         = readOpenCodeAuth
+	exchangeCopilotTokenFunc     = exchangeCopilotToken
+	fetchCopilotUserFunc         = fetchCopilotUser
 )
 
 const (
@@ -397,43 +400,62 @@ func exchangeCopilotToken(oauthToken string) (string, error) {
 		return "", fmt.Errorf("copilot oauth token is empty")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotTokenURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create copilot token request: %w", err)
-	}
-	req.Header.Set("Authorization", "token "+oauthToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
-
 	client := &http.Client{Timeout: copilotTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("copilot token request: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
 
-	if resp.StatusCode != http.StatusOK {
-		excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
-		if excerpt != "" {
-			return "", fmt.Errorf("copilot token exchange returned %d: %s", resp.StatusCode, excerpt)
+		req, err := http.NewRequestWithContext(ctx, method, copilotTokenURL, nil)
+		if err != nil {
+			cancel()
+			return "", fmt.Errorf("create copilot token request: %w", err)
 		}
-		return "", fmt.Errorf("copilot token exchange returned %d", resp.StatusCode)
+		req.Header.Set("Authorization", "token "+oauthToken)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = fmt.Errorf("copilot token request (%s): %w", method, err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
+			resp.Body.Close()
+			cancel()
+			if excerpt != "" {
+				lastErr = fmt.Errorf("copilot token exchange (%s) returned %d: %s", method, resp.StatusCode, excerpt)
+			} else {
+				lastErr = fmt.Errorf("copilot token exchange (%s) returned %d", method, resp.StatusCode)
+			}
+			continue
+		}
+
+		var tokenResp CopilotTokenResponse
+		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+			resp.Body.Close()
+			cancel()
+			lastErr = fmt.Errorf("parse copilot token response (%s): %w", method, err)
+			continue
+		}
+		resp.Body.Close()
+		cancel()
+
+		sessionToken := strings.TrimSpace(tokenResp.Token)
+		if sessionToken == "" {
+			lastErr = fmt.Errorf("copilot token response (%s) missing token", method)
+			continue
+		}
+
+		return sessionToken, nil
 	}
 
-	var tokenResp CopilotTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", fmt.Errorf("parse copilot token response: %w", err)
+	if lastErr != nil {
+		return "", lastErr
 	}
-
-	sessionToken := strings.TrimSpace(tokenResp.Token)
-	if sessionToken == "" {
-		return "", fmt.Errorf("copilot token response missing token")
-	}
-
-	return sessionToken, nil
+	return "", fmt.Errorf("copilot token exchange failed")
 }
 
 func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
@@ -441,39 +463,58 @@ func fetchCopilotUser(sessionToken string) (*CopilotUserResponse, error) {
 		return nil, fmt.Errorf("copilot session token is empty")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotUserURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create copilot user request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+sessionToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
-	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
-
 	client := &http.Client{Timeout: copilotTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("copilot user request: %w", err)
-	}
-	defer resp.Body.Close()
+	authValues := []string{"Bearer " + sessionToken, "token " + sessionToken}
+	var lastErr error
+	for _, authValue := range authValues {
+		ctx, cancel := context.WithTimeout(context.Background(), copilotTimeout)
 
-	if resp.StatusCode != http.StatusOK {
-		excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
-		if excerpt != "" {
-			return nil, fmt.Errorf("copilot user API returned %d: %s", resp.StatusCode, excerpt)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotUserURL, nil)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("create copilot user request: %w", err)
 		}
-		return nil, fmt.Errorf("copilot user API returned %d", resp.StatusCode)
+		req.Header.Set("Authorization", authValue)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
+		req.Header.Set("Copilot-Integration-Id", "vscode-chat")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = fmt.Errorf("copilot user request: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			excerpt := readHTTPErrorExcerpt(resp.Body, httpErrorExcerptLimit)
+			resp.Body.Close()
+			cancel()
+			if excerpt != "" {
+				lastErr = fmt.Errorf("copilot user API returned %d: %s", resp.StatusCode, excerpt)
+			} else {
+				lastErr = fmt.Errorf("copilot user API returned %d", resp.StatusCode)
+			}
+			continue
+		}
+
+		var userResp CopilotUserResponse
+		if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
+			resp.Body.Close()
+			cancel()
+			lastErr = fmt.Errorf("parse copilot user response: %w", err)
+			continue
+		}
+		resp.Body.Close()
+		cancel()
+
+		return &userResp, nil
 	}
 
-	var userResp CopilotUserResponse
-	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
-		return nil, fmt.Errorf("parse copilot user response: %w", err)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-
-	return &userResp, nil
+	return nil, fmt.Errorf("copilot user request failed")
 }
 
 func calculateQuotaProjection(used int, entitlement int, now time.Time) (projected int, daysLeft int, pace string) {
@@ -516,19 +557,23 @@ func calculateQuotaProjection(used int, entitlement int, now time.Time) (project
 }
 
 func fetchCopilotQuota() (DashboardData, error) {
-	oauthToken, err := readOpenCodeAuth()
+	oauthToken, err := readOpenCodeAuthFunc()
 	if err != nil {
 		return DashboardData{}, err
 	}
 
-	sessionToken, err := exchangeCopilotToken(oauthToken)
-	if err != nil {
-		return DashboardData{}, err
-	}
-
-	userResp, err := fetchCopilotUser(sessionToken)
-	if err != nil {
-		return DashboardData{}, err
+	// Prefer direct token usage first (some auth.json tokens are already valid
+	// for copilot_internal/user). Fall back to exchange endpoint when needed.
+	userResp, directErr := fetchCopilotUserFunc(oauthToken)
+	if directErr != nil {
+		sessionToken, exchangeErr := exchangeCopilotTokenFunc(oauthToken)
+		if exchangeErr != nil {
+			return DashboardData{}, fmt.Errorf("copilot auth failed (direct token: %v; exchange: %v)", directErr, exchangeErr)
+		}
+		userResp, err = fetchCopilotUserFunc(sessionToken)
+		if err != nil {
+			return DashboardData{}, fmt.Errorf("copilot user request with exchanged token failed: %w", err)
+		}
 	}
 
 	resetAt, err := time.ParseInLocation("2006-01-02", userResp.QuotaResetDate, time.Local)
