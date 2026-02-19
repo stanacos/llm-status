@@ -81,12 +81,13 @@ func injectBorderTitle(box string, title string) string {
 	titleStyled := lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render(title)
 
 	// Build: ╭── Title ─────────╮
+	prefixText := "╭── "
+	suffixText := "╮"
 	prefix := bc.Render("╭── ")
 	suffix := bc.Render("╮")
 	titleWithSpace := titleStyled + " "
 
-	// Visible width consumed: 4 (╭── ) + title len + 1 (space) + 1 (╮)
-	usedWidth := 4 + len(title) + 1 + 1
+	usedWidth := lipgloss.Width(prefixText) + lipgloss.Width(title+" ") + lipgloss.Width(suffixText)
 	dashCount := totalWidth - usedWidth
 	if dashCount < 0 {
 		dashCount = 0

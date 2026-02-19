@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -64,6 +65,35 @@ func TestParseLatestTokenCountFromFile(t *testing.T) {
 			status, err := parseLatestTokenCountFromFile(path)
 			tc.check(t, status, err)
 		})
+	}
+}
+
+func TestParseLatestTokenCountFromFileSkipsVeryLongLine(t *testing.T) {
+	now := time.Now().UTC()
+	hugeLine := fmt.Sprintf(
+		`{"timestamp":"2026-02-19T09:59:00Z","type":"event_msg","payload":{"type":"assistant_message","message":"%s"}}`,
+		strings.Repeat("x", 17*1024*1024),
+	)
+	validLine := validTokenCountLine(
+		"2026-02-19T10:00:00Z",
+		now.Add(2*time.Hour).Unix(),
+		now.Add(4*24*time.Hour).Unix(),
+		22,
+		44,
+	)
+
+	dir := t.TempDir()
+	path := writeJSONL(t, dir, "session.jsonl", hugeLine, validLine)
+
+	status, err := parseLatestTokenCountFromFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status == nil {
+		t.Fatal("expected status, got nil")
+	}
+	if !status.hasSession || !status.hasWeekly {
+		t.Fatalf("expected session+weekly data, got session=%v weekly=%v", status.hasSession, status.hasWeekly)
 	}
 }
 
@@ -176,6 +206,192 @@ func TestIsPlausibleResetTime(t *testing.T) {
 	}
 	if isPlausibleResetTime(now, now.Add(24*time.Hour), sessionWindow) {
 		t.Fatal("expected far-future session reset to be implausible")
+	}
+}
+
+func TestLocalTimezoneAt(t *testing.T) {
+	tests := []struct {
+		name     string
+		now      time.Time
+		envTZ    string
+		inferred string
+		want     string
+	}{
+		{
+			name:     "prefers TZ environment",
+			now:      time.Date(2026, 2, 19, 12, 0, 0, 0, time.FixedZone("Local", -8*3600)),
+			envTZ:    "America/New_York",
+			inferred: "America/Los_Angeles",
+			want:     "America/New_York",
+		},
+		{
+			name:     "uses non-local location name",
+			now:      time.Date(2026, 2, 19, 12, 0, 0, 0, time.FixedZone("America/Chicago", -6*3600)),
+			envTZ:    "",
+			inferred: "America/Los_Angeles",
+			want:     "America/Chicago",
+		},
+		{
+			name:     "uses inferred timezone for Local",
+			now:      time.Date(2026, 2, 19, 12, 0, 0, 0, time.FixedZone("Local", -8*3600)),
+			envTZ:    "",
+			inferred: "America/Los_Angeles",
+			want:     "America/Los_Angeles",
+		},
+		{
+			name:     "returns empty when no TZ can be inferred",
+			now:      time.Date(2026, 2, 19, 12, 0, 0, 0, time.FixedZone("Local", -8*3600)),
+			envTZ:    "",
+			inferred: "",
+			want:     "",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := localTimezoneAt(tc.now, tc.envTZ, tc.inferred)
+			if got != tc.want {
+				t.Fatalf("timezone: got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetCachedCostUsesStaleDataOnRefreshError(t *testing.T) {
+	originalNow := nowFunc
+	originalCaches := resourceCaches
+	defer func() {
+		nowFunc = originalNow
+		resourceCaches = originalCaches
+	}()
+
+	resetResourceCaches()
+	current := time.Date(2026, 2, 19, 12, 0, 0, 0, time.UTC)
+	nowFunc = func() time.Time { return current }
+
+	calls := 0
+	fetch := func() (*costResult, error) {
+		calls++
+		if calls == 1 {
+			return &costResult{
+				dailyCost:      2.5,
+				dailyTokens:    2000,
+				hasDailyData:   true,
+				monthlyCost:    12.0,
+				monthlyTokens:  9000,
+				hasMonthlyData: true,
+			}, nil
+		}
+		return nil, errors.New("transient failure")
+	}
+
+	first, stale, err := getCachedCost(ProviderClaude, fetch)
+	if err != nil || stale {
+		t.Fatalf("first fetch unexpected stale/err: stale=%v err=%v", stale, err)
+	}
+	if first == nil || !first.hasDailyData {
+		t.Fatalf("expected cached cost data, got %+v", first)
+	}
+	if calls != 1 {
+		t.Fatalf("calls after first fetch: got %d want 1", calls)
+	}
+
+	current = current.Add(2 * time.Minute)
+	second, stale, err := getCachedCost(ProviderClaude, fetch)
+	if err != nil || stale {
+		t.Fatalf("expected in-ttl cache hit, got stale=%v err=%v", stale, err)
+	}
+	if second == nil || second.dailyCost != first.dailyCost {
+		t.Fatalf("unexpected cached second result: %+v", second)
+	}
+	if calls != 1 {
+		t.Fatalf("calls after ttl-hit: got %d want 1", calls)
+	}
+
+	current = current.Add(costCacheTTL + time.Second)
+	third, stale, err := getCachedCost(ProviderClaude, fetch)
+	if err == nil || !stale {
+		t.Fatalf("expected stale result with refresh error, got stale=%v err=%v", stale, err)
+	}
+	if third == nil || third.dailyCost != first.dailyCost {
+		t.Fatalf("expected stale cached data, got %+v", third)
+	}
+	if calls != 2 {
+		t.Fatalf("calls after stale refresh failure: got %d want 2", calls)
+	}
+
+	current = current.Add(30 * time.Second)
+	_, stale, err = getCachedCost(ProviderClaude, fetch)
+	if err != nil || stale {
+		t.Fatalf("expected failure-retry TTL cache hit, got stale=%v err=%v", stale, err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls after failure retry window hit: got %d want 2", calls)
+	}
+}
+
+func TestGetCachedVersionDedupesInFlightFetches(t *testing.T) {
+	originalNow := nowFunc
+	originalCaches := resourceCaches
+	defer func() {
+		nowFunc = originalNow
+		resourceCaches = originalCaches
+	}()
+
+	resetResourceCaches()
+	nowFunc = func() time.Time {
+		return time.Date(2026, 2, 19, 12, 0, 0, 0, time.UTC)
+	}
+
+	var mu sync.Mutex
+	calls := 0
+	fetch := func() (string, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		return "1.2.3", nil
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan string, 2)
+	errs := make(chan error, 2)
+	stales := make(chan bool, 2)
+
+	run := func() {
+		defer wg.Done()
+		version, stale, err := getCachedVersion(ProviderCodex, fetch)
+		results <- version
+		stales <- stale
+		errs <- err
+	}
+
+	wg.Add(2)
+	go run()
+	go run()
+	wg.Wait()
+	close(results)
+	close(stales)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	for stale := range stales {
+		if stale {
+			t.Fatal("did not expect stale result")
+		}
+	}
+	for version := range results {
+		if version != "1.2.3" {
+			t.Fatalf("unexpected version: %q", version)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("expected a single in-flight fetch call, got %d", calls)
 	}
 }
 
