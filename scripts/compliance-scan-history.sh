@@ -51,8 +51,19 @@ history_snapshot="$(mktemp)"
 metadata_snapshot="$(mktemp)"
 trap 'rm -f "$history_snapshot" "$metadata_snapshot"' EXIT
 
-git log --all --no-color -p --pretty=format:'commit %H' > "$history_snapshot"
-git log --all --format='%H:%an <%ae>' > "$metadata_snapshot"
+declare -a scan_refs=()
+while IFS= read -r ref_name; do
+  if [[ -n "$ref_name" ]]; then
+    scan_refs+=("$ref_name")
+  fi
+done < <(git for-each-ref --format='%(refname)' refs/heads refs/tags)
+
+if (( ${#scan_refs[@]} == 0 )); then
+  scan_refs=("HEAD")
+fi
+
+git log --no-color -p --pretty=format:'commit %H' "${scan_refs[@]}" > "$history_snapshot"
+git log --format='%H:%an <%ae>' "${scan_refs[@]}" > "$metadata_snapshot"
 
 violations=0
 
