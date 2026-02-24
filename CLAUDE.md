@@ -65,7 +65,7 @@ Single-package app (`package main`) at repo root.
 
 ### OpenCode
 - Copilot quota API via OpenCode auth (`~/.local/share/opencode/auth.json` or `$OPENCODE_DATA_DIR/auth.json`)
-- `npx @ccusage/opencode@latest`
+- `npx @ccusage/opencode` (disabled — no npm-compatible version exists)
 - `opencode version` (fallback `opencode --version`)
 
 ## Config Notes
