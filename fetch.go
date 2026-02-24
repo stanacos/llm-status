@@ -67,6 +67,7 @@ var (
 	exchangeCopilotTokenFunc     = exchangeCopilotToken
 	fetchCopilotUserFunc         = fetchCopilotUser
 	resourceCaches               = newProviderResourceCaches()
+	anthropicHTTPClient          = &http.Client{Timeout: 15 * time.Second}
 )
 
 const (
@@ -167,8 +168,13 @@ func (c *cachedValue[T]) get(ttl time.Duration, fetch func() (T, error)) (T, boo
 		if c.inFlight {
 			waitCh := c.waitCh
 			c.mu.Unlock()
-			<-waitCh
-			continue
+			select {
+			case <-waitCh:
+				continue
+			case <-time.After(2 * time.Minute):
+				var zero T
+				return zero, false, fmt.Errorf("cache fetch timed out waiting for in-flight request")
+			}
 		}
 
 		c.inFlight = true
@@ -178,7 +184,16 @@ func (c *cachedValue[T]) get(ttl time.Duration, fetch func() (T, error)) (T, boo
 		hasStale := c.hasValue
 		c.mu.Unlock()
 
-		freshValue, err := fetch()
+		var freshValue T
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("cache fetch panic: %v", r)
+				}
+			}()
+			freshValue, err = fetch()
+		}()
 		finishedAt := nowFunc()
 
 		c.mu.Lock()
@@ -1190,7 +1205,7 @@ func refreshOAuthToken(refreshToken string) (*OAuthTokenResponse, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := anthropicHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("refresh request: %w", err)
 	}
@@ -1304,7 +1319,7 @@ func doUsageRequest(token string) (*UsageData, int, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("llm-status/%s", version))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := anthropicHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("API request: %w", err)
 	}
@@ -1714,6 +1729,10 @@ func warmUpOpenCode() error {
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(os.Kill)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
