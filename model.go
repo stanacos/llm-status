@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	refreshInterval = 60
-	minWidth        = 56
-	minHeight       = 20
+	refreshInterval  = 60
+	maxFetchDuration = 2 * time.Minute
+	minWidth         = 56
+	minHeight        = 20
 )
 
 var (
@@ -28,6 +29,7 @@ type model struct {
 	data             DashboardData
 	spinner          spinner.Model
 	fetching         bool
+	fetchStartedAt   time.Time
 	warmingUp        bool
 	queuedRefresh    bool
 	width            int
@@ -135,6 +137,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = StateDashboard
 				m.selectedProvider = chosen
 				m.fetching = true
+				m.fetchStartedAt = time.Now()
 				m.queuedRefresh = false
 				m.secondsToRefresh = refreshInterval
 				m.data = DashboardData{ProviderID: chosen}
@@ -154,6 +157,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.fetching = true
+			m.fetchStartedAt = time.Now()
 			m.secondsToRefresh = refreshInterval
 			return m, fetchAllDataCmd(m.selectedProvider)
 		case "w":
@@ -165,6 +169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			m.state = StateChooseProvider
 			m.fetching = false
+			m.fetchStartedAt = time.Time{}
 			m.queuedRefresh = false
 			m.providerMenuIdx = providerIndex(m.selectedProvider)
 			return m, nil
@@ -180,12 +185,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, doTick()
 		}
 		if m.fetching {
+			if !m.fetchStartedAt.IsZero() && time.Since(m.fetchStartedAt) > maxFetchDuration {
+				m.fetching = false
+				m.fetchStartedAt = time.Time{}
+				appendSanitizedError(&m.data.Errors, "Fetch timed out — press r to retry")
+			}
 			return m, doTick()
 		}
 
 		m.secondsToRefresh--
 		if m.secondsToRefresh <= 0 {
 			m.fetching = true
+			m.fetchStartedAt = time.Now()
 			m.secondsToRefresh = refreshInterval
 			return m, tea.Batch(doTick(), fetchAllDataCmd(m.selectedProvider))
 		}
@@ -202,10 +213,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.queuedRefresh {
 			m.queuedRefresh = false
 			m.fetching = true
+			m.fetchStartedAt = time.Now()
 			m.secondsToRefresh = refreshInterval
 			return m, fetchAllDataCmd(m.selectedProvider)
 		}
 		m.fetching = false
+		m.fetchStartedAt = time.Time{}
 		return m, nil
 
 	case warmupFinishedMsg:
