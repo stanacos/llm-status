@@ -72,6 +72,15 @@ var (
 const (
 	claudeWarmUpPrompt = "Reply with exactly: ok. Do not use any tools."
 	codexWarmUpPrompt  = "Reply with exactly: ok. Do not run any tools."
+
+	// ccusage package versions — pinned to avoid breaking changes from
+	// upstream (v18+ uses pnpm-only runtime: protocol that npm cannot resolve).
+	// Update these when a new compatible version is verified with npx.
+	ccusageVersion      = "ccusage@17"
+	ccusageCodexVersion = "@ccusage/codex@17"
+	// @ccusage/opencode has no v17 (jumped from 0.1.0 to 18.x).
+	// Pinned to last known version; stale-on-error cache handles failures.
+	ccusageOpenCodeVersion = "@ccusage/opencode@latest"
 )
 
 // costResult holds parsed results from a single cost command call.
@@ -1378,7 +1387,7 @@ func fetchClaudeCcusage() (*costResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	output, err := runCommand(ctx, "npx", "ccusage@latest", "daily", "--json", "--since", since)
+	output, err := runCommand(ctx, "npx", "--yes", ccusageVersion, "daily", "--json", "--since", since)
 	if err != nil {
 		return nil, fmt.Errorf("run ccusage: %w", err)
 	}
@@ -1428,7 +1437,8 @@ func fetchCodexCcusage() (*costResult, error) {
 	defer cancel()
 
 	args := []string{
-		"@ccusage/codex@latest",
+		"--yes",
+		ccusageCodexVersion,
 		"daily",
 		"--json",
 		"--since",
@@ -1483,7 +1493,7 @@ func fetchOpenCodeCcusage() (*costResult, error) {
 		ctx,
 		"npx",
 		"--yes",
-		"@ccusage/opencode@latest",
+		ccusageOpenCodeVersion,
 		"daily",
 		"--json",
 		"--since",

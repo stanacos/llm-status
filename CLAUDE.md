@@ -55,12 +55,12 @@ Single-package app (`package main`) at repo root.
 
 ### Claude
 - OAuth usage API (`~/.claude/.credentials.json`)
-- `npx ccusage@latest`
+- `npx ccusage@17`
 - `claude --version`
 
 ### Codex
 - `~/.codex/sessions/*.jsonl` (`token_count` events)
-- `npx @ccusage/codex@latest`
+- `npx @ccusage/codex@17`
 - `codex --version`
 
 ### OpenCode
