@@ -79,9 +79,10 @@ const (
 	// Update these when a new compatible version is verified with npx.
 	ccusageVersion      = "ccusage@17"
 	ccusageCodexVersion = "@ccusage/codex@17"
-	// @ccusage/opencode has no v17 (jumped from 0.1.0 to 18.x).
-	// Pinned to last known version; stale-on-error cache handles failures.
-	ccusageOpenCodeVersion = "@ccusage/opencode@latest"
+	// @ccusage/opencode has no npm-compatible version (jumped from
+	// unbuilt 0.1.0 to 18.x which uses pnpm-only runtime: protocol).
+	// Disabled until upstream publishes an npm-compatible release.
+	ccusageOpenCodeVersion = ""
 )
 
 // costResult holds parsed results from a single cost command call.
@@ -1498,6 +1499,10 @@ func fetchCodexCcusage() (*costResult, error) {
 
 // fetchOpenCodeCcusage runs @ccusage/opencode for the last 30 days and extracts today + totals.
 func fetchOpenCodeCcusage() (*costResult, error) {
+	if ccusageOpenCodeVersion == "" {
+		return nil, nil
+	}
+
 	now := nowFunc()
 	since := now.AddDate(0, 0, -30).Format("20060102")
 
