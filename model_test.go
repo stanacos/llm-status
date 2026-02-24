@@ -275,3 +275,186 @@ func TestWarmUpErrorPersistsAfterSuccessfulRefresh(t *testing.T) {
 		t.Fatalf("unexpected merged error tail: %q", got)
 	}
 }
+
+func TestMergeDataExpiresStaleSessionData(t *testing.T) {
+	staleReset := time.Now().Add(-10 * time.Minute) // well past staleResetThreshold
+
+	old := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: true,
+		SessionUtil:    80.0,
+		SessionResets:  staleReset,
+	}
+	new := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: false, // fetch failed to get session data
+		LastUpdated:    time.Now(),
+	}
+
+	result := mergeData(old, new)
+	if result.HasSessionData {
+		t.Fatal("expected stale session data to be expired")
+	}
+	if result.SessionUtil != 0 {
+		t.Fatalf("expected SessionUtil=0 after expiry, got %.1f", result.SessionUtil)
+	}
+	if !result.SessionResets.IsZero() {
+		t.Fatalf("expected zero SessionResets after expiry, got %v", result.SessionResets)
+	}
+}
+
+func TestMergeDataPreservesRecentSessionData(t *testing.T) {
+	recentReset := time.Now().Add(-1 * time.Minute) // within staleResetThreshold
+
+	old := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: true,
+		SessionUtil:    80.0,
+		SessionResets:  recentReset,
+	}
+	new := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: false,
+		LastUpdated:    time.Now(),
+	}
+
+	result := mergeData(old, new)
+	if !result.HasSessionData {
+		t.Fatal("expected recent session data to be preserved")
+	}
+	if result.SessionUtil != 80.0 {
+		t.Fatalf("expected SessionUtil=80.0, got %.1f", result.SessionUtil)
+	}
+}
+
+func TestMergeDataExpiresStaleWeeklyData(t *testing.T) {
+	staleReset := time.Now().Add(-10 * time.Minute)
+
+	old := DashboardData{
+		ProviderID:    ProviderClaude,
+		HasWeeklyData: true,
+		WeeklyUtil:    50.0,
+		WeeklyResets:  staleReset,
+	}
+	new := DashboardData{
+		ProviderID:    ProviderClaude,
+		HasWeeklyData: false,
+		LastUpdated:   time.Now(),
+	}
+
+	result := mergeData(old, new)
+	if result.HasWeeklyData {
+		t.Fatal("expected stale weekly data to be expired")
+	}
+	if result.WeeklyUtil != 0 {
+		t.Fatalf("expected WeeklyUtil=0 after expiry, got %.1f", result.WeeklyUtil)
+	}
+}
+
+func TestMergeDataNewDataOverridesStaleExpiry(t *testing.T) {
+	staleReset := time.Now().Add(-10 * time.Minute)
+	freshReset := time.Now().Add(5 * time.Hour)
+
+	old := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: true,
+		SessionUtil:    80.0,
+		SessionResets:  staleReset,
+	}
+	new := DashboardData{
+		ProviderID:     ProviderClaude,
+		HasSessionData: true, // fresh data arrived
+		SessionUtil:    5.0,
+		SessionResets:  freshReset,
+		LastUpdated:    time.Now(),
+	}
+
+	result := mergeData(old, new)
+	if !result.HasSessionData {
+		t.Fatal("expected new session data to override expiry")
+	}
+	if result.SessionUtil != 5.0 {
+		t.Fatalf("expected SessionUtil=5.0, got %.1f", result.SessionUtil)
+	}
+	if !result.SessionResets.Equal(freshReset) {
+		t.Fatalf("expected fresh reset time, got %v", result.SessionResets)
+	}
+}
+
+func TestTickAcceleratesRefreshNearReset(t *testing.T) {
+	nearReset := time.Now().Add(30 * time.Second) // < nearResetThreshold (2min)
+
+	m := model{
+		state:            StateDashboard,
+		selectedProvider: ProviderClaude,
+		secondsToRefresh: 55, // would normally count down from 60
+		data: DashboardData{
+			ProviderID:     ProviderClaude,
+			HasSessionData: true,
+			SessionResets:  nearReset,
+		},
+	}
+
+	nextModel, cmd := m.Update(tickMsg{})
+	if cmd == nil {
+		t.Fatal("expected tick command")
+	}
+	after := nextModel.(model)
+
+	// secondsToRefresh should be clamped to fastRefreshInterval
+	if after.secondsToRefresh > fastRefreshInterval {
+		t.Fatalf("expected secondsToRefresh <= %d near reset, got %d",
+			fastRefreshInterval, after.secondsToRefresh)
+	}
+}
+
+func TestTickNormalRefreshWhenFarFromReset(t *testing.T) {
+	farReset := time.Now().Add(3 * time.Hour) // well beyond nearResetThreshold
+
+	m := model{
+		state:            StateDashboard,
+		selectedProvider: ProviderClaude,
+		secondsToRefresh: 55,
+		data: DashboardData{
+			ProviderID:     ProviderClaude,
+			HasSessionData: true,
+			SessionResets:  farReset,
+		},
+	}
+
+	nextModel, cmd := m.Update(tickMsg{})
+	if cmd == nil {
+		t.Fatal("expected tick command")
+	}
+	after := nextModel.(model)
+
+	// Should decrement normally, not clamp
+	if after.secondsToRefresh != 54 {
+		t.Fatalf("expected secondsToRefresh=54 far from reset, got %d", after.secondsToRefresh)
+	}
+}
+
+func TestRenderSessionPanelShowsResettingWhenPastReset(t *testing.T) {
+	pastReset := time.Now().Add(-5 * time.Minute) // reset is in the past
+
+	m := model{
+		state:            StateDashboard,
+		selectedProvider: ProviderClaude,
+		width:            120,
+		height:           40,
+		data: DashboardData{
+			ProviderID:     ProviderClaude,
+			HasSessionData: true,
+			SessionUtil:    80.0,
+			SessionResets:  pastReset,
+		},
+	}
+
+	view := m.renderSessionPanel()
+	if !strings.Contains(view, "Resetting") {
+		t.Fatalf("expected 'Resetting' in session panel when past reset, got:\n%s", view)
+	}
+	if strings.Contains(view, "now") {
+		t.Fatalf("should not show 'now' when past reset, got:\n%s", view)
+	}
+}

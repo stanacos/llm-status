@@ -10,10 +10,13 @@ import (
 )
 
 const (
-	refreshInterval  = 60
-	maxFetchDuration = 2 * time.Minute
-	minWidth         = 56
-	minHeight        = 20
+	refreshInterval     = 60
+	fastRefreshInterval = 15
+	maxFetchDuration    = 2 * time.Minute
+	staleResetThreshold = 5 * time.Minute
+	nearResetThreshold  = 2 * time.Minute
+	minWidth            = 56
+	minHeight           = 20
 )
 
 var (
@@ -194,6 +197,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.secondsToRefresh--
+
+		// Accelerate refresh when near/past a reset window.
+		if m.data.HasSessionData && !m.data.SessionResets.IsZero() &&
+			time.Until(m.data.SessionResets) < nearResetThreshold &&
+			m.secondsToRefresh > fastRefreshInterval {
+			m.secondsToRefresh = fastRefreshInterval
+		}
+
 		if m.secondsToRefresh <= 0 {
 			m.fetching = true
 			m.fetchStartedAt = time.Now()
@@ -459,7 +470,11 @@ func (m model) renderSessionPanel() string {
 		return renderPanel(title, content, cw)
 	}
 
-	resetStr := formatDuration(time.Until(m.data.SessionResets))
+	resetDur := time.Until(m.data.SessionResets)
+	resetStr := formatDuration(resetDur)
+	if resetDur <= 0 {
+		resetStr = "Resetting…"
+	}
 	resetAt := m.data.SessionResets.Local().Format("15:04")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
@@ -543,6 +558,22 @@ func mergeData(old, new DashboardData) DashboardData {
 
 	result := old
 	result.ProviderID = new.ProviderID
+
+	// Expire stale session data when reset time is well past and new fetch has no update.
+	if !new.HasSessionData && old.HasSessionData && !old.SessionResets.IsZero() &&
+		time.Since(old.SessionResets) > staleResetThreshold {
+		result.HasSessionData = false
+		result.SessionResets = time.Time{}
+		result.SessionUtil = 0
+	}
+
+	// Expire stale weekly data when reset time is well past and new fetch has no update.
+	if !new.HasWeeklyData && old.HasWeeklyData && !old.WeeklyResets.IsZero() &&
+		time.Since(old.WeeklyResets) > staleResetThreshold {
+		result.HasWeeklyData = false
+		result.WeeklyResets = time.Time{}
+		result.WeeklyUtil = 0
+	}
 
 	if new.HasSessionData {
 		result.SessionUtil = new.SessionUtil
