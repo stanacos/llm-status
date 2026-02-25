@@ -55,17 +55,17 @@ Single-package app (`package main`) at repo root.
 
 ### Claude
 - OAuth usage API (`~/.claude/.credentials.json`)
-- `npx ccusage@17`
+- `npx ccusage@latest`
 - `claude --version`
 
 ### Codex
 - `~/.codex/sessions/*.jsonl` (`token_count` events)
-- `npx @ccusage/codex@17`
+- `npx @ccusage/codex@latest`
 - `codex --version`
 
 ### OpenCode
 - Copilot quota API via OpenCode auth (`~/.local/share/opencode/auth.json` or `$OPENCODE_DATA_DIR/auth.json`)
-- `npx @ccusage/opencode` (disabled — no npm-compatible version exists)
+- `npx @ccusage/opencode@latest`
 - `opencode version` (fallback `opencode --version`)
 
 ## Config Notes
