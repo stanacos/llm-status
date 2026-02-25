@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -602,4 +603,142 @@ func TestRunCommandWritesDebugLogWhenEnabled(t *testing.T) {
 	if !strings.Contains(logText, secretPath) {
 		t.Fatalf("expected debug log to include command detail path %q, got %q", secretPath, logText)
 	}
+}
+
+func writeCredentialsFixture(t *testing.T, path string, creds *CredentialsFile) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir for credentials fixture: %v", err)
+	}
+	data, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("marshal credentials fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write credentials fixture: %v", err)
+	}
+}
+
+func TestReadClaudeCredentials(t *testing.T) {
+	origKeychain := readKeychainCredentialsFunc
+	origGoos := goos
+	defer func() {
+		readKeychainCredentialsFunc = origKeychain
+		goos = origGoos
+	}()
+
+	validCreds := &CredentialsFile{
+		ClaudeAiOauth: OAuthCredentials{
+			AccessToken:  "file-access-token",
+			RefreshToken: "file-refresh-token",
+		},
+	}
+
+	keychainCreds := &CredentialsFile{
+		ClaudeAiOauth: OAuthCredentials{
+			AccessToken:  "keychain-access-token",
+			RefreshToken: "keychain-refresh-token",
+		},
+	}
+
+	t.Run("uses JSON file when valid", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		writeCredentialsFixture(t, credPath, validCreds)
+
+		readKeychainCredentialsFunc = func() ([]byte, error) {
+			t.Fatal("keychain should not be called when JSON file is valid")
+			return nil, nil
+		}
+
+		creds, path, err := readClaudeCredentials()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if creds.ClaudeAiOauth.AccessToken != "file-access-token" {
+			t.Fatalf("got token %q, want %q", creds.ClaudeAiOauth.AccessToken, "file-access-token")
+		}
+		if path != credPath {
+			t.Fatalf("got path %q, want %q", path, credPath)
+		}
+	})
+
+	t.Run("falls back to keychain on darwin when file missing", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		goos = "darwin"
+
+		keychainData, _ := json.Marshal(keychainCreds)
+		readKeychainCredentialsFunc = func() ([]byte, error) {
+			return keychainData, nil
+		}
+
+		creds, _, err := readClaudeCredentials()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if creds.ClaudeAiOauth.AccessToken != "keychain-access-token" {
+			t.Fatalf("got token %q, want %q", creds.ClaudeAiOauth.AccessToken, "keychain-access-token")
+		}
+	})
+
+	t.Run("does not try keychain on non-darwin", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		goos = "linux"
+
+		readKeychainCredentialsFunc = func() ([]byte, error) {
+			t.Fatal("keychain should not be called on linux")
+			return nil, nil
+		}
+
+		_, _, err := readClaudeCredentials()
+		if err == nil {
+			t.Fatal("expected error when file missing on linux, got nil")
+		}
+		if !strings.Contains(err.Error(), "read credentials") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("returns error when file missing and keychain fails", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		goos = "darwin"
+
+		readKeychainCredentialsFunc = func() ([]byte, error) {
+			return nil, fmt.Errorf("security: SecKeychainSearchCopyNext: The specified item could not be found")
+		}
+
+		_, _, err := readClaudeCredentials()
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "keychain failed") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("prefers JSON file over keychain", func(t *testing.T) {
+		homeDir := t.TempDir()
+		t.Setenv("HOME", homeDir)
+		goos = "darwin"
+
+		credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		writeCredentialsFixture(t, credPath, validCreds)
+
+		readKeychainCredentialsFunc = func() ([]byte, error) {
+			t.Fatal("keychain should not be called when JSON file is valid")
+			return nil, nil
+		}
+
+		creds, _, err := readClaudeCredentials()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if creds.ClaudeAiOauth.AccessToken != "file-access-token" {
+			t.Fatalf("got token %q, want %q", creds.ClaudeAiOauth.AccessToken, "file-access-token")
+		}
+	})
 }
