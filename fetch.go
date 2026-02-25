@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,8 @@ var (
 	readOpenCodeAuthFunc         = readOpenCodeAuth
 	exchangeCopilotTokenFunc     = exchangeCopilotToken
 	fetchCopilotUserFunc         = fetchCopilotUser
+	readKeychainCredentialsFunc  = readKeychainCredentials
+	goos                         = runtime.GOOS
 	resourceCaches               = newProviderResourceCaches()
 	anthropicHTTPClient          = &http.Client{Timeout: 15 * time.Second}
 )
@@ -1261,6 +1264,68 @@ func saveCredentials(credPath string, creds *CredentialsFile) error {
 	return nil
 }
 
+// readKeychainCredentials reads Claude credentials from the macOS Keychain.
+func readKeychainCredentials() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "security", "find-generic-password",
+		"-s", "Claude Code-credentials", "-w")
+	output, err := cmd.Output()
+	if err != nil {
+		debugLogf("keychain read failed err=%v", err)
+		return nil, fmt.Errorf("keychain read failed: %w", err)
+	}
+
+	raw := bytes.TrimSpace(output)
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("keychain entry is empty")
+	}
+	return raw, nil
+}
+
+// readClaudeCredentials reads OAuth credentials from the JSON file first,
+// falling back to the macOS Keychain on darwin.
+func readClaudeCredentials() (*CredentialsFile, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, "", fmt.Errorf("home dir: %w", err)
+	}
+
+	credPath := filepath.Join(home, ".claude", ".credentials.json")
+
+	// Try JSON file first (works on all platforms).
+	if credData, err := os.ReadFile(credPath); err == nil {
+		var creds CredentialsFile
+		if parseErr := json.Unmarshal(credData, &creds); parseErr == nil {
+			if creds.ClaudeAiOauth.AccessToken != "" {
+				return &creds, credPath, nil
+			}
+			debugLogf("credentials file parsed but no access token found path=%q", credPath)
+		} else {
+			debugLogf("credentials file parse failed path=%q err=%v", credPath, parseErr)
+		}
+	}
+
+	// On macOS, try the Keychain as fallback.
+	if goos == "darwin" {
+		keychainData, kerr := readKeychainCredentialsFunc()
+		if kerr != nil {
+			return nil, credPath, fmt.Errorf("read credentials: no valid file at %s and keychain failed: %w", credPath, kerr)
+		}
+		var creds CredentialsFile
+		if err := json.Unmarshal(keychainData, &creds); err != nil {
+			return nil, credPath, fmt.Errorf("parse keychain credentials: %w", err)
+		}
+		if creds.ClaudeAiOauth.AccessToken == "" {
+			return nil, credPath, fmt.Errorf("keychain credentials have no access token")
+		}
+		return &creds, credPath, nil
+	}
+
+	return nil, credPath, fmt.Errorf("read credentials: %s", credPath)
+}
+
 // ensureValidToken checks if the token is still valid and refreshes it if needed.
 // Returns the access token to use.
 func ensureValidToken(credPath string, creds *CredentialsFile) (string, error) {
@@ -1334,28 +1399,13 @@ func doUsageRequest(token string) (*UsageData, int, error) {
 // fetchOAuthUsage reads credentials and fetches usage from the Anthropic OAuth API.
 // Automatically refreshes expired tokens using the OAuth2 refresh_token grant.
 func fetchOAuthUsage() (*UsageData, error) {
-	home, err := os.UserHomeDir()
+	creds, credPath, err := readClaudeCredentials()
 	if err != nil {
-		return nil, fmt.Errorf("home dir: %w", err)
-	}
-
-	credPath := filepath.Join(home, ".claude", ".credentials.json")
-	credData, err := os.ReadFile(credPath)
-	if err != nil {
-		return nil, fmt.Errorf("read credentials: %w", err)
-	}
-
-	var creds CredentialsFile
-	if err := json.Unmarshal(credData, &creds); err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
-	}
-
-	if creds.ClaudeAiOauth.AccessToken == "" {
-		return nil, fmt.Errorf("no access token found")
+		return nil, err
 	}
 
 	// Proactively refresh if token is expired or near-expiry
-	token, err := ensureValidToken(credPath, &creds)
+	token, err := ensureValidToken(credPath, creds)
 	if err != nil {
 		return nil, err
 	}
@@ -1368,7 +1418,7 @@ func fetchOAuthUsage() (*UsageData, error) {
 
 	// On 401, try one more refresh + retry (clock skew, server-side revocation, etc.)
 	if statusCode == 401 {
-		newToken, refreshErr := refreshAndSave(credPath, &creds)
+		newToken, refreshErr := refreshAndSave(credPath, creds)
 		if refreshErr != nil {
 			return nil, refreshErr
 		}

@@ -54,7 +54,7 @@ Single-package app (`package main`) at repo root.
 ## Provider Data Sources
 
 ### Claude
-- OAuth usage API (`~/.claude/.credentials.json`)
+- OAuth usage API (`~/.claude/.credentials.json`, macOS Keychain fallback)
 - `npx ccusage@latest`
 - `claude --version`
 
