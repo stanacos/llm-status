@@ -34,6 +34,7 @@ const (
 	copilotTokenURL   = "https://api.github.com/copilot_internal/v2/token"
 	copilotUserURL    = "https://api.github.com/copilot_internal/user"
 	copilotTimeout    = 10 * time.Second
+	oauthAPITimeout   = 15 * time.Second
 
 	httpErrorExcerptLimit = 512
 	debugLogEnvVar        = "LLM_STATUS_DEBUG_LOG"
@@ -1194,7 +1195,7 @@ func refreshOAuthToken(refreshToken string) (*OAuthTokenResponse, error) {
 		"client_id":     {oauthClientID},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), oauthAPITimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", oauthTokenURL, strings.NewReader(form.Encode()))
@@ -1366,7 +1367,7 @@ func refreshAndSave(credPath string, creds *CredentialsFile) (string, error) {
 
 // doUsageRequest performs the HTTP GET to the usage API and returns the parsed data.
 func doUsageRequest(token string) (*UsageData, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), oauthAPITimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/api/oauth/usage", nil)
@@ -1427,6 +1428,17 @@ func fetchOAuthUsage() (*UsageData, error) {
 			return nil, err
 		}
 		return usage, nil
+	}
+
+	// On transient network/timeout errors (no HTTP response), retry once after a short delay
+	if statusCode == 0 {
+		debugLogf("OAuth usage request failed with transient error, retrying: %v", err)
+		time.Sleep(2 * time.Second)
+		usage, _, retryErr := doUsageRequest(token)
+		if retryErr == nil {
+			return usage, nil
+		}
+		debugLogf("OAuth usage retry also failed: %v", retryErr)
 	}
 
 	return nil, err
